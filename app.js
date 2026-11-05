@@ -408,7 +408,8 @@ async function fetchViaProxy(u) {
   const candidates = ["allorigins", "corsproxy.io", "cors.workers.dev", "isomorphic-git"];
   for (const key of candidates) {
     try {
-      const r = await fetch(PROXY_BUILDERS[key](u));
+      const signal = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined;
+      const r = await fetch(PROXY_BUILDERS[key](u), { signal });
       if (r.ok) return await r.text();
     } catch (e) { /* next */ }
   }
