@@ -57,57 +57,67 @@ function modeList() {
   return [...new Set(list)]; // dedupe (direct mode excluded above)
 }
 
-function totalFromContentRange(cr) {
-  const m = cr && cr.match(/\/(\d+| \*)\s*$/);
-  if (!m || m[1] === "*") return null;
-  return parseInt(m[1], 10);
-}
-
 /**
- * Probe candidates with a SUFFIX range ("bytes=-2" → last 2 bytes).
- * This proves the server honours Range without needing to read the
- * Content-Range header (which cross-origin fetches often hide).
+ * Probe candidates with an explicit 1-byte range ("bytes=0-1").
+ * Proves honest Range support via the 206 status; the Content-Range
+ * header is often hidden by CORS and is never relied on.
  */
 async function probe(url) {
   const candidates = modeList();
   for (const key of candidates) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
-      const r = await fetch(target, { headers: { Range: "bytes=-2" } });
-      if (!r.ok) continue;
-      const body = new Uint8Array(await r.arrayBuffer());
-      const total = totalFromContentRange(r.headers.get("content-range"));
-      if (r.status === 206 && body.byteLength === 2) {
-        return { key, total }; // total may be null (header hidden) — that's fine
-      }
-      if (r.status === 200) continue; // server ignored Range
+      const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
+      if (r.status !== 206) continue; // 200 → server ignores Range; anything else → broken
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (buf.byteLength >= 1) return { key };
     } catch (e) { /* next candidate */ }
   }
   return null;
 }
 
-/** Fetch the LAST n bytes via a suffix range (works without knowing total size). */
-async function getBytesSuffix(n, signal) {
-  const candidates = modeList();
-  const order = conn && conn.key
-    ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
-    : candidates;
-  let lastErr = null;
-  for (const key of order) {
-    const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
-    try {
-      const r = await fetch(target, { headers: { Range: `bytes=-${n}` }, signal });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (r.status === 206) return buf;
-      if (buf.byteLength > n) throw new Error("server ignored Range (full body)");
-      return buf; // small file returned whole
-    } catch (e) {
-      if (e.name === "AbortError") throw e;
-      lastErr = e;
+/**
+ * Find the exact file size using tiny 1-byte range probes:
+ * "bytes=N-N" answers 206 while N exists and 416 once N is past the end.
+ * Cost ≈ 2 × log2(size) one-byte requests.
+ */
+async function findSize(signal) {
+  const probeByte = async (pos) => {
+    const candidates = modeList();
+    const order = conn && conn.key
+      ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
+      : candidates;
+    for (const key of order) {
+      const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
+      try {
+        const r = await fetch(target, { headers: { Range: `bytes=${pos}-${pos}` }, signal });
+        if (r.status === 416) return "eof";
+        if (r.ok) {
+          const b = await r.arrayBuffer();
+          if (b.byteLength > 0) return "ok";
+        }
+      } catch (e) {
+        if (e.name === "AbortError") throw e;
+      }
     }
+    throw new Error("Size probe failed (no candidate answered a 1-byte range).");
+  };
+  let lo = 0, hi = 4096;
+  // exponential search: grow hi until it is past the end
+  for (;;) {
+    const v = await probeByte(hi);
+    if (v === "eof") break;
+    lo = hi;
+    hi *= 2;
+    if (hi > 34359738368) throw new Error("File too large / size probe gave up at 32 GiB.");
   }
-  throw new Error("Range fetch failed: " + (lastErr && lastErr.message));
+  // binary search for exact end
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    const v = await probeByte(mid);
+    if (v === "ok") lo = mid; else hi = mid;
+  }
+  return lo + 1;
 }
 
 /** Chosen fetcher state after probe */
@@ -153,13 +163,16 @@ class RemoteZip {
   }
 
   async open(progressCb, signal) {
-    // 1) locate End Of Central Directory in the file tail — using a SUFFIX
-    //    range so we don't need to know the total file size at all.
-    const tailLen = Math.min(66 * 1024, /* may be less if file is smaller */ 0x7fffffff);
+    // 1) find the exact file size with 1-byte probes (Content-Range is hidden
+    //    by CORS on strict hosts, so we never rely on it)
+    const total = await findSize(signal);
+    conn.total = total;
     progressCb && progressCb(0.02);
-    const tail = await getBytesSuffix(tailLen, signal);
+
+    // 2) locate End Of Central Directory in the file tail
+    const tailLen = Math.min(66 * 1024, total);
+    const tail = await getBytes(total - tailLen, tailLen, signal);
     if (tail.byteLength < 22) throw new Error("File too small to be a ZIP.");
-    const total = tail.byteLength < tailLen ? tail.byteLength : null; // exact size only if file < 66KB
     const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
     let eocdIdx = -1;
     for (let i = tailLen - 22; i >= 0; i--) {
@@ -483,8 +496,8 @@ async function load() {
       );
       return;
     }
-    conn = { key: p.key, total: p.total, url };
-    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Reading ZIP index…`);
+    conn = { key: p.key, total: null, url };
+    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`);
 
     const zip = new RemoteZip();
     const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`));
