@@ -1,5 +1,5 @@
-/* ============================================================
-   ZipStream — play a single file out of a hosted ZIP remotely.
+﻿/* ============================================================
+   ZipStream â€” play a single file out of a hosted ZIP remotely.
    Reads the ZIP central directory over HTTP Range requests and
    downloads ONLY the byte-span of the chosen file.
    ============================================================ */
@@ -68,7 +68,7 @@ async function probe(url) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
       const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
-      if (r.status !== 206) continue; // 200 → server ignores Range; anything else → broken
+      if (r.status !== 206) continue; // 200 â†’ server ignores Range; anything else â†’ broken
       const buf = new Uint8Array(await r.arrayBuffer());
       if (buf.byteLength >= 1) return { key };
     } catch (e) { /* next candidate */ }
@@ -79,7 +79,7 @@ async function probe(url) {
 /**
  * Find the exact file size using tiny 1-byte range probes:
  * "bytes=N-N" answers 206 while N exists and 416 once N is past the end.
- * Cost ≈ 2 × log2(size) one-byte requests.
+ * Cost â‰ˆ 2 Ã— log2(size) one-byte requests.
  */
 async function findSize(signal) {
   const probeByte = async (pos) => {
@@ -218,7 +218,7 @@ function bigIntFromPair(dv, off) {
   return hi * 4294967296 + lo;
 }
 
-/** Parse central directory records from a Uint8Array (relative offsets = absolute − cdOffBase). */
+/** Parse central directory records from a Uint8Array (relative offsets = absolute âˆ’ cdOffBase). */
 function parseCentralDirectory(cd, count, cdAbsOffset) {
   const dv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
   const td = new TextDecoder();
@@ -307,7 +307,7 @@ async function playEntry(entry) {
   playerCard.hidden = false;
   playerCard.scrollIntoView({ behavior: "smooth", block: "start" });
   playerTitle.textContent = entry.name;
-  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
+  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry â€” inflating in your browser";
   revokeLast();
   player.src = "";
   loadBtn.disabled = true;
@@ -315,7 +315,7 @@ async function playEntry(entry) {
   currentAbort = signal;
 
   try {
-    // resolve local header → exact data offset
+    // resolve local header â†’ exact data offset
     const sigLoc = await getBytes(entry.localOffset, 30, signal.signal);
     const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
     if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
@@ -338,7 +338,7 @@ async function playEntry(entry) {
         got = pos;
         const frac = got / entry.compSize;
         const speed = got / ((performance.now() - t0) / 1000);
-        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
+        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} Â· ${fmtBytes(speed)}/s Â· only this entry, not the whole ZIP`);
       }
     } else if (entry.method === 8) {
       // deflate: fetch compressed chunks, stream-inflate while downloading
@@ -359,11 +359,11 @@ async function playEntry(entry) {
         await writer.write(c);
         pos += c.byteLength;
         const frac = pos / entry.compSize;
-        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
+        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed Â· inflatingâ€¦`);
       }
       await writer.close();
       await readAll;
-      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
+      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated â€” ZIP may be encrypted.");
     } else {
       throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
     }
@@ -376,15 +376,15 @@ async function playEntry(entry) {
     const secs = (performance.now() - t0) / 1000;
     setProgress(false);
     setStatus(
-      `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
+      `âœ… Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
       (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
-      ` — the ZIP stayed on the server.`,
+      ` â€” the ZIP stayed on the server.`,
       "ok"
     );
   } catch (e) {
     setProgress(false);
     if (e.name === "AbortError") setStatus("Cancelled.", "warn");
-    else setStatus("❌ Playback failed: " + e.message + (String(e.message).includes("DecompressionStream") ? "\nYour browser lacks DecompressionStream — use a current Chrome/Edge/Firefox." : ""), "err");
+    else setStatus("âŒ Playback failed: " + e.message + (String(e.message).includes("DecompressionStream") ? "\nYour browser lacks DecompressionStream â€” use a current Chrome/Edge/Firefox." : ""), "err");
   } finally {
     loadBtn.disabled = false;
     currentAbort = null;
@@ -423,7 +423,7 @@ function decodeEntities(s) {
 async function handleTelegram(text) {
   const info = parseTelegramLink(text);
   tgCard.hidden = false;
-  tgBody.innerHTML = "<p class='note'>Resolving Telegram post…</p>";
+  tgBody.innerHTML = "<p class='note'>Resolving Telegram postâ€¦</p>";
   const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}?embed=1&mode=tme`;
   const html = await fetchViaProxy(target);
   if (!html) {
@@ -437,19 +437,19 @@ async function handleTelegram(text) {
   const zips = [...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))];
   const title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
 
-  let htmlOut = `<p class="note">Channel: <b>@${info.channel}</b>${info.post ? ` · post #${info.post}` : ""}${title ? ` · ${title}` : ""}</p>`;
+  let htmlOut = `<p class="note">Channel: <b>@${info.channel}</b>${info.post ? ` Â· post #${info.post}` : ""}${title ? ` Â· ${title}` : ""}</p>`;
 
   if (videos.length) {
-    htmlOut += `<p>🎬 Found ${videos.length} playable media file(s) in the web preview:</p>`;
-    videos.forEach((v, i) => { htmlOut += `<div class="row"><button class="ghost" data-videourl="${v}">▶ Stream video #${i + 1}</button></div>`; });
+    htmlOut += `<p>ðŸŽ¬ Found ${videos.length} playable media file(s) in the web preview:</p>`;
+    videos.forEach((v, i) => { htmlOut += `<div class="row"><button class="ghost" data-videourl="${v}">â–¶ Stream video #${i + 1}</button></div>`; });
   } else if (photos.length || ogImage) {
     const img = photos[0] || ogImage;
-    htmlOut += `<p>🖼️ This Telegram post contains a <b>photo</b>. Telegram serves the image via its CDN preview:</p><img class="tg-thumb" src="${img}" alt="Telegram post image">`;
+    htmlOut += `<p>ðŸ–¼ï¸ This Telegram post contains a <b>photo</b>. Telegram serves the image via its CDN preview:</p><img class="tg-thumb" src="${img}" alt="Telegram post image">`;
   } else if (zips.length) {
-    htmlOut += `<p>📦 Found a .zip link in the post — open it in ZipStream:</p>`;
-    zips.forEach((z) => { htmlOut += `<div class="row"><button class="ghost" data-zipurl="${z}">📦 ${z}</button></div>`; });
+    htmlOut += `<p>ðŸ“¦ Found a .zip link in the post â€” open it in ZipStream:</p>`;
+    zips.forEach((z) => { htmlOut += `<div class="row"><button class="ghost" data-zipurl="${z}">ðŸ“¦ ${z}</button></div>`; });
   } else {
-    htmlOut += `<p class="status warn">This post has no media exposed through Telegram's public web preview.\n\nℹ️ <b>Why can't videos from Telegram be streamed?</b> Telegram only serves file contents to the signed-in Telegram client API (bot or user session), not to anonymous web visitors. A pure browser app can stream photos and anything linked in the caption, but video attachments require a Telegram Bot/User API backend.\n\n✅ For ZIP files from Telegram, download-aware hosting (Google Drive, Dropbox, GitHub, any web server) works directly — paste its link above.</p>`;
+    htmlOut += `<p class="status warn">This post has no media exposed through Telegram's public web preview.\n\nâ„¹ï¸ <b>Why can't videos from Telegram be streamed?</b> Telegram only serves file contents to the signed-in Telegram client API (bot or user session), not to anonymous web visitors. A pure browser app can stream photos and anything linked in the caption, but video attachments require a Telegram Bot/User API backend.\n\nâœ… For ZIP files from Telegram, download-aware hosting (Google Drive, Dropbox, GitHub, any web server) works directly â€” paste its link above.</p>`;
   }
   tgBody.innerHTML = htmlOut;
   tgBody.querySelectorAll("[data-videourl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.videourl; load().then(playDirect); }));
@@ -486,11 +486,11 @@ async function load() {
       await handleTelegram(url);
       return;
     }
-    setStatus("Connecting…");
+    setStatus("Connectingâ€¦");
     const p = await probe(url);
     if (!p) {
       setStatus(
-        "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
+        "âŒ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
         "The file host must return 206 Partial Content (Google Drive viewer URLs, for example, don't).\n" +
         "Try a different mode in the Connection dropdown, or a direct link to the .zip file (hosts like GitHub raw, Dropbox and most web servers work).",
         "err"
@@ -498,23 +498,23 @@ async function load() {
       return;
     }
     conn = { key: p.key, total: null, url };
-    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`);
+    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP indexâ€¦`);
 
     const zip = new RemoteZip();
-    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`));
+    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP indexâ€¦ ${Math.round(f * 100)}%`));
 
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
-    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
+    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` Â· ZIP size ${fmtBytes(conn.total)}` : ""}`;
     renderEntries(entries);
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
     setProgress(false);
-    setStatus(`✅ Read the ZIP index: ${entries.length} files. Pick a video — only its bytes will be downloaded.`, "ok");
+    setStatus(`âœ… Read the ZIP index: ${entries.length} files. Pick a video â€” only its bytes will be downloaded.`, "ok");
   } catch (e) {
     setProgress(false);
-    setStatus("❌ " + e.message, "err");
+    setStatus("âŒ " + e.message, "err");
   } finally {
     loadBtn.disabled = false;
   }
@@ -540,7 +540,7 @@ function renderEntries(entries) {
       li.querySelector(".badge").classList.add("playable");
       const btn = document.createElement("button");
       btn.className = "playbtn";
-      btn.textContent = "▶ Play";
+      btn.textContent = "â–¶ Play";
       btn.addEventListener("click", () => playEntry(e));
       li.appendChild(btn);
     } else {
@@ -566,6 +566,6 @@ function fmtBytes(n) {
 loadBtn.addEventListener("click", load);
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
 cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
-$("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/main/demo.zip"; load(); });
-$("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/main/demo2.zip"; load(); });
+$("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo.zip"; load(); });
+$("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo2.zip"; load(); });
 $("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });
