@@ -1,5 +1,5 @@
-﻿/* ============================================================
-   ZipStream â€” play a single file out of a hosted ZIP remotely.
+/* ============================================================
+   ZipStream — play a single file out of a hosted ZIP remotely.
    Reads the ZIP central directory over HTTP Range requests and
    downloads ONLY the byte-span of the chosen file.
    ============================================================ */
@@ -68,7 +68,7 @@ async function probe(url) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
       const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
-      if (r.status !== 206) continue; // 200 â†’ server ignores Range; anything else â†’ broken
+      if (r.status !== 206) continue; // 200 → server ignores Range; anything else → broken
       const buf = new Uint8Array(await r.arrayBuffer());
       if (buf.byteLength >= 1) return { key };
     } catch (e) { /* next candidate */ }
@@ -79,7 +79,7 @@ async function probe(url) {
 /**
  * Find the exact file size using tiny 1-byte range probes:
  * "bytes=N-N" answers 206 while N exists and 416 once N is past the end.
- * Cost â‰ˆ 2 Ã— log2(size) one-byte requests.
+ * Cost ≈ 2 × log2(size) one-byte requests.
  */
 async function findSize(signal) {
   const probeByte = async (pos) => {
@@ -218,7 +218,7 @@ function bigIntFromPair(dv, off) {
   return hi * 4294967296 + lo;
 }
 
-/** Parse central directory records from a Uint8Array (relative offsets = absolute âˆ’ cdOffBase). */
+/** Parse central directory records from a Uint8Array (relative offsets = absolute − cdOffBase). */
 function parseCentralDirectory(cd, count, cdAbsOffset) {
   const dv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
   const td = new TextDecoder();
@@ -307,7 +307,7 @@ async function playEntry(entry) {
   playerCard.hidden = false;
   playerCard.scrollIntoView({ behavior: "smooth", block: "start" });
   playerTitle.textContent = entry.name;
-  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry â€” inflating in your browser";
+  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
   revokeLast();
   player.src = "";
   loadBtn.disabled = true;
@@ -315,7 +315,7 @@ async function playEntry(entry) {
   currentAbort = signal;
 
   try {
-    // resolve local header â†’ exact data offset
+    // resolve local header → exact data offset
     const sigLoc = await getBytes(entry.localOffset, 30, signal.signal);
     const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
     if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
@@ -338,7 +338,7 @@ async function playEntry(entry) {
         got = pos;
         const frac = got / entry.compSize;
         const speed = got / ((performance.now() - t0) / 1000);
-        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} Â· ${fmtBytes(speed)}/s Â· only this entry, not the whole ZIP`);
+        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
       }
     } else if (entry.method === 8) {
       // deflate: fetch compressed chunks, stream-inflate while downloading
@@ -359,11 +359,11 @@ async function playEntry(entry) {
         await writer.write(c);
         pos += c.byteLength;
         const frac = pos / entry.compSize;
-        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed Â· inflatingâ€¦`);
+        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
       }
       await writer.close();
       await readAll;
-      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated â€” ZIP may be encrypted.");
+      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
     } else {
       throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
     }
@@ -376,15 +376,15 @@ async function playEntry(entry) {
     const secs = (performance.now() - t0) / 1000;
     setProgress(false);
     setStatus(
-      `âœ… Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
+      `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
       (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
-      ` â€” the ZIP stayed on the server.`,
+      ` — the ZIP stayed on the server.`,
       "ok"
     );
   } catch (e) {
     setProgress(false);
     if (e.name === "AbortError") setStatus("Cancelled.", "warn");
-    else setStatus("âŒ Playback failed: " + e.message + (String(e.message).includes("DecompressionStream") ? "\nYour browser lacks DecompressionStream â€” use a current Chrome/Edge/Firefox." : ""), "err");
+    else setStatus("❌ Playback failed: " + e.message + (String(e.message).includes("DecompressionStream") ? "\nYour browser lacks DecompressionStream — use a current Chrome/Edge/Firefox." : ""), "err");
   } finally {
     loadBtn.disabled = false;
     currentAbort = null;
@@ -416,6 +416,25 @@ async function fetchViaProxy(u) {
   return null;
 }
 
+/** Jina Reader � CORS-friendly page reader that returns markdown. Last-resort Telegram fetch. */
+async function fetchViaJina(u) {
+  try {
+    const r = await fetch("https://r.jina.ai/" + u, {
+      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined,
+    });
+    if (r.ok) return await r.text();
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+function parseMarkdownMedia(md) {
+  const unescape = (s) => s.replace(/\\_/g, "_").replace(/\\\(/g, "(").replace(/\\\)/g, ")");
+  const urls = new Set();
+  for (const m of md.matchAll(/!?\[[^\]]*\]\((https?:\/\/[^\s)]+?)\)/g)) urls.add(unescape(m[1]));
+  for (const m of md.matchAll(/(?:https?:\/\/cdn[^\s)"']*telesco\.pe\/[^\s)"']+)/g)) urls.add(unescape(m[0]));
+  return [...urls];
+}
+
 function decodeEntities(s) {
   return s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
@@ -423,36 +442,72 @@ function decodeEntities(s) {
 async function handleTelegram(text) {
   const info = parseTelegramLink(text);
   tgCard.hidden = false;
-  tgBody.innerHTML = "<p class='note'>Resolving Telegram postâ€¦</p>";
-  const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}?embed=1&mode=tme`;
-  const html = await fetchViaProxy(target);
-  if (!html) {
-    tgBody.innerHTML = `<p class="status err">Couldn't reach Telegram's web preview through any proxy. Private channels and some media can't be shown from the web.</p>`;
+  tgBody.innerHTML = "<p class='note'>Resolving Telegram post…</p>";
+  const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}`;
+  const embedUrl = target + "?embed=1&mode=tme";
+
+  // path 1: HTML widget via generic proxies — richest data
+  let media = null, channel = null, title = null;
+  const html = await fetchViaProxy(embedUrl);
+  if (html) {
+    const ogImage = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1];
+    const telesco = [...new Set([...html.matchAll(/(?:src|href)="(https:\/\/cdn[^"]*telesco\.pe\/file\/[^"]+)"/g)].map((m) => decodeEntities(m[1])))];
+    channel = (html.match(/tg:\/\/resolve\?domain=([A-Za-z0-9_]+)/) || [])[1] || info.channel;
+    title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
+    media = classifyMedia([
+      ...telesco,
+      ...(ogImage ? [ogImage] : []),
+      ...[...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))],
+      ...[...new Set([...html.matchAll(/(?:src|href)="(https?:\/\/[^"]+\.(?:mp4|mkv|webm|mov|jpe?g|png))/gi)].map((m) => decodeEntities(m[1])))],
+    ]);
+    media.ogImage = ogImage;
+  }
+
+  // path 2: jina markdown reader (CORS-reflection — survives proxy outages)
+  if (!media || (!media.videos.length && !media.photos.length && !media.zips.length)) {
+    const md = await fetchViaJina(embedUrl);
+    if (md) {
+      const jMedia = classifyMedia(parseMarkdownMedia(md));
+      if (media) {
+        media.videos = media.videos.length ? media.videos : jMedia.videos;
+        media.photos = media.photos.length ? media.photos : jMedia.photos;
+        media.zips = media.zips.length ? media.zips : jMedia.zips;
+      } else {
+        media = { ...jMedia, ogImage: null };
+      }
+      channel = channel || info.channel;
+    }
+  }
+
+  const got = media && (media.videos.length || media.photos.length || media.zips.length);
+  if (!media || !got) {
+    tgBody.innerHTML = `<p class="status ${html ? "warn" : "err"}">${
+      html
+        ? `Reached Telegram, but this post's media is not exposed by Telegram's web preview.\n\nℹ️ <b>Why?</b> Telegram only serves attachment files (videos, big files sent as documents) to the signed-in Telegram client API, not to anonymous web visitors. Photos and caption links are visible; attachments are not.\n\n✅ If the post has a .zip link (Google Drive, Dropbox, GitHub…), paste that here instead — ZipStream streams it directly.`
+        : `Couldn't reach Telegram's web preview through any proxy right now (free public CORS proxies are offline/rate-limited — this is temporary, try again in a few minutes).\n\nℹ️ Even when reachable, Telegram never exposes attachment files to anonymous web visitors — videos/documents need the Telegram API with a login.`
+    }</p>`;
     return;
   }
-  const ogImage = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1];
-  const telesco = [...new Set([...html.matchAll(/(?:src|href)="(https:\/\/cdn[^"]*telesco\.pe\/file\/[^"]+)"/g)].map((m) => decodeEntities(m[1])))];
-  const videos = telesco.filter((u) => /\.(mp4|mkv|webm|mov)(\?|$)/i.test(u));
-  const photos = telesco.filter((u) => /\.(jpg|jpeg|png)/i.test(u));
-  const zips = [...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))];
-  const title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
 
-  let htmlOut = `<p class="note">Channel: <b>@${info.channel}</b>${info.post ? ` Â· post #${info.post}` : ""}${title ? ` Â· ${title}` : ""}</p>`;
-
-  if (videos.length) {
-    htmlOut += `<p>ðŸŽ¬ Found ${videos.length} playable media file(s) in the web preview:</p>`;
-    videos.forEach((v, i) => { htmlOut += `<div class="row"><button class="ghost" data-videourl="${v}">â–¶ Stream video #${i + 1}</button></div>`; });
-  } else if (photos.length || ogImage) {
-    const img = photos[0] || ogImage;
-    htmlOut += `<p>ðŸ–¼ï¸ This Telegram post contains a <b>photo</b>. Telegram serves the image via its CDN preview:</p><img class="tg-thumb" src="${img}" alt="Telegram post image">`;
-  } else if (zips.length) {
-    htmlOut += `<p>ðŸ“¦ Found a .zip link in the post â€” open it in ZipStream:</p>`;
-    zips.forEach((z) => { htmlOut += `<div class="row"><button class="ghost" data-zipurl="${z}">ðŸ“¦ ${z}</button></div>`; });
-  } else {
-    htmlOut += `<p class="status warn">This post has no media exposed through Telegram's public web preview.\n\nâ„¹ï¸ <b>Why can't videos from Telegram be streamed?</b> Telegram only serves file contents to the signed-in Telegram client API (bot or user session), not to anonymous web visitors. A pure browser app can stream photos and anything linked in the caption, but video attachments require a Telegram Bot/User API backend.\n\nâœ… For ZIP files from Telegram, download-aware hosting (Google Drive, Dropbox, GitHub, any web server) works directly â€” paste its link above.</p>`;
+  let htmlOut = `<p class="note">Channel: <b>@${channel || info.channel}</b>${info.post ? ` · post #${info.post}` : ""}${title ? ` · ${title}` : ""}</p>`;
+  if (media.videos.length) {
+    htmlOut += `<p>🎬 Playable media link(s) found:</p>`;
+    media.videos.forEach((v, i) => { htmlOut += `<div class="row"><button class="ghost" data-videourl="${v}">▶ Stream video #${i + 1}</button></div>`; });
+  }
+  if (media.zips.length) {
+    htmlOut += `<p>📦 .zip link(s) in the post — open in ZipStream:</p>`;
+    media.zips.forEach((z) => { htmlOut += `<div class="row"><button class="ghost" data-zipurl="${z}">📦 ${z}</button></div>`; });
+  }
+  if (media.photos.length) {
+    htmlOut += `<p>🖼️ Photo media from the post:</p><img class="tg-thumb" src="${decodeEntities(media.photos[0])}" alt="Telegram post image">`;
+  } else if (media.ogImage) {
+    htmlOut += `<p>🖼️ Photo preview (og:image):</p><img class="tg-thumb" src="${decodeEntities(media.ogImage)}" alt="Telegram post image">`;
+  }
+  if (!media.videos.length && !media.zips.length) {
+    htmlOut += `<p class="note tip">ℹ️ This post is a photo, so it displays as an image. Telegram video/document attachments can't be streamed anonymously from the web — they need the Telegram API with a login (bot/user token). A ZIP link in the caption would work: paste it above.</p>`;
   }
   tgBody.innerHTML = htmlOut;
-  tgBody.querySelectorAll("[data-videourl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.videourl; load().then(playDirect); }));
+  tgBody.querySelectorAll("[data-videourl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.videourl; playDirect(); }));
   tgBody.querySelectorAll("[data-zipurl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.zipurl; load(); }));
 }
 
@@ -486,11 +541,11 @@ async function load() {
       await handleTelegram(url);
       return;
     }
-    setStatus("Connectingâ€¦");
+    setStatus("Connecting…");
     const p = await probe(url);
     if (!p) {
       setStatus(
-        "âŒ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
+        "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
         "The file host must return 206 Partial Content (Google Drive viewer URLs, for example, don't).\n" +
         "Try a different mode in the Connection dropdown, or a direct link to the .zip file (hosts like GitHub raw, Dropbox and most web servers work).",
         "err"
@@ -498,23 +553,23 @@ async function load() {
       return;
     }
     conn = { key: p.key, total: null, url };
-    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP indexâ€¦`);
+    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`);
 
     const zip = new RemoteZip();
-    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP indexâ€¦ ${Math.round(f * 100)}%`));
+    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`));
 
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
-    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` Â· ZIP size ${fmtBytes(conn.total)}` : ""}`;
+    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
     renderEntries(entries);
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
     setProgress(false);
-    setStatus(`âœ… Read the ZIP index: ${entries.length} files. Pick a video â€” only its bytes will be downloaded.`, "ok");
+    setStatus(`✅ Read the ZIP index: ${entries.length} files. Pick a video — only its bytes will be downloaded.`, "ok");
   } catch (e) {
     setProgress(false);
-    setStatus("âŒ " + e.message, "err");
+    setStatus("❌ " + e.message, "err");
   } finally {
     loadBtn.disabled = false;
   }
@@ -540,7 +595,7 @@ function renderEntries(entries) {
       li.querySelector(".badge").classList.add("playable");
       const btn = document.createElement("button");
       btn.className = "playbtn";
-      btn.textContent = "â–¶ Play";
+      btn.textContent = "▶ Play";
       btn.addEventListener("click", () => playEntry(e));
       li.appendChild(btn);
     } else {
