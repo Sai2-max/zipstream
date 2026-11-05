@@ -63,26 +63,51 @@ function totalFromContentRange(cr) {
   return parseInt(m[1], 10);
 }
 
-/** Probe candidates: which one answers 206 with a known total size? */
+/**
+ * Probe candidates with a SUFFIX range ("bytes=-2" → last 2 bytes).
+ * This proves the server honours Range without needing to read the
+ * Content-Range header (which cross-origin fetches often hide).
+ */
 async function probe(url) {
   const candidates = modeList();
   for (const key of candidates) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
-      const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
+      const r = await fetch(target, { headers: { Range: "bytes=-2" } });
       if (!r.ok) continue;
-      const cr = r.headers.get("content-range");
-      let total = totalFromContentRange(cr);
-      if (r.status === 206 && total) {
-        return { key, total };
+      const body = new Uint8Array(await r.arrayBuffer());
+      const total = totalFromContentRange(r.headers.get("content-range"));
+      if (r.status === 206 && body.byteLength === 2) {
+        return { key, total }; // total may be null (header hidden) — that's fine
       }
-      if (r.status === 200 && r.headers.get("content-range")) {
-        // some proxies answer 200 but forward content-range (full body) — keep as last resort
-        if (total) return { key, total };
-      }
+      if (r.status === 200) continue; // server ignored Range
     } catch (e) { /* next candidate */ }
   }
   return null;
+}
+
+/** Fetch the LAST n bytes via a suffix range (works without knowing total size). */
+async function getBytesSuffix(n, signal) {
+  const candidates = modeList();
+  const order = conn && conn.key
+    ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
+    : candidates;
+  let lastErr = null;
+  for (const key of order) {
+    const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
+    try {
+      const r = await fetch(target, { headers: { Range: `bytes=-${n}` }, signal });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (r.status === 206) return buf;
+      if (buf.byteLength > n) throw new Error("server ignored Range (full body)");
+      return buf; // small file returned whole
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      lastErr = e;
+    }
+  }
+  throw new Error("Range fetch failed: " + (lastErr && lastErr.message));
 }
 
 /** Chosen fetcher state after probe */
@@ -98,13 +123,14 @@ async function getBytes(start, length, signal) {
   let lastErr = null;
   for (const key of order) {
     const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
-    const need = Math.min(length, conn.total - start);
+    const need = length;
     if (need <= 0) return new Uint8Array(0);
     try {
       const r = await fetch(target, {
         headers: { Range: `bytes=${start}-${start + need - 1}` },
         signal,
       });
+      if (r.status === 416) throw new Error("range past end of file");
       if (!r.ok) throw new Error("HTTP " + r.status);
       const buf = new Uint8Array(await r.arrayBuffer());
       if (buf.byteLength === 0) throw new Error("empty response");
@@ -127,13 +153,13 @@ class RemoteZip {
   }
 
   async open(progressCb, signal) {
-    const total = conn.total;
-    if (!total || total < 22) throw new Error("Cannot determine ZIP size from the server.");
-
-    // 1) locate End Of Central Directory in the file tail
-    const tailLen = Math.min(66 * 1024, total);
+    // 1) locate End Of Central Directory in the file tail — using a SUFFIX
+    //    range so we don't need to know the total file size at all.
+    const tailLen = Math.min(66 * 1024, /* may be less if file is smaller */ 0x7fffffff);
     progressCb && progressCb(0.02);
-    const tail = await getBytes(total - tailLen, tailLen, signal);
+    const tail = await getBytesSuffix(tailLen, signal);
+    if (tail.byteLength < 22) throw new Error("File too small to be a ZIP.");
+    const total = tail.byteLength < tailLen ? tail.byteLength : null; // exact size only if file < 66KB
     const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
     let eocdIdx = -1;
     for (let i = tailLen - 22; i >= 0; i--) {
@@ -452,7 +478,7 @@ async function load() {
       setStatus(
         "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
         "The file host must return 206 Partial Content (Google Drive viewer URLs, for example, don't).\n" +
-        "Try a different mode in the Connection dropdown, or a direct link to the .zip file (Zoom-in on hosts like GitHub raw, Dropbox, any web server).",
+        "Try a different mode in the Connection dropdown, or a direct link to the .zip file (hosts like GitHub raw, Dropbox and most web servers work).",
         "err"
       );
       return;
@@ -465,7 +491,7 @@ async function load() {
 
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
-    zipMetaEl.textContent = `${entries.length} files · total ZIP size ${fmtBytes(conn.total)}`;
+    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
     renderEntries(entries);
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
