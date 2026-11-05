@@ -404,24 +404,32 @@ function parseTelegramLink(url) {
   return { channel: m[1], post: m[2] ? parseInt(m[2], 10) : null };
 }
 
+/** Manual timeout wrapper — reliable even where AbortSignal.timeout is flaky. */
+function fetchWithTimeout(url, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout after " + ms + "ms")), ms);
+    fetch(url).then(
+      (r) => { clearTimeout(timer); resolve(r); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 async function fetchViaProxy(u) {
   const candidates = ["allorigins", "corsproxy.io", "cors.workers.dev", "isomorphic-git"];
   for (const key of candidates) {
     try {
-      const signal = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined;
-      const r = await fetch(PROXY_BUILDERS[key](u), { signal });
+      const r = await fetchWithTimeout(PROXY_BUILDERS[key](u), 15000);
       if (r.ok) return await r.text();
     } catch (e) { /* next */ }
   }
   return null;
 }
 
-/** Jina Reader � CORS-friendly page reader that returns markdown. Last-resort Telegram fetch. */
+/** Jina Reader - CORS-friendly page reader that returns markdown. Fastest Telegram path. */
 async function fetchViaJina(u) {
   try {
-    const r = await fetch("https://r.jina.ai/" + u, {
-      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined,
-    });
+    const r = await fetchWithTimeout("https://r.jina.ai/" + u, 30000);
     if (r.ok) return await r.text();
   } catch (e) { /* fall through */ }
   return null;
@@ -446,43 +454,45 @@ async function handleTelegram(text) {
   const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}`;
   const embedUrl = target + "?embed=1&mode=tme";
 
-  // path 1: HTML widget via generic proxies — richest data
-  let media = null, channel = null, title = null;
-  const html = await fetchViaProxy(embedUrl);
-  if (html) {
-    const ogImage = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1];
-    const telesco = [...new Set([...html.matchAll(/(?:src|href)="(https:\/\/cdn[^"]*telesco\.pe\/file\/[^"]+)"/g)].map((m) => decodeEntities(m[1])))];
-    channel = (html.match(/tg:\/\/resolve\?domain=([A-Za-z0-9_]+)/) || [])[1] || info.channel;
-    title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
-    media = classifyMedia([
-      ...telesco,
-      ...(ogImage ? [ogImage] : []),
-      ...[...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))],
-      ...[...new Set([...html.matchAll(/(?:src|href)="(https?:\/\/[^"]+\.(?:mp4|mkv|webm|mov|jpe?g|png))/gi)].map((m) => decodeEntities(m[1])))],
-    ]);
-    media.ogImage = ogImage;
-  }
-
-  // path 2: jina markdown reader (CORS-reflection — survives proxy outages)
-  if (!media || (!media.videos.length && !media.photos.length && !media.zips.length)) {
-    const md = await fetchViaJina(embedUrl);
-    if (md) {
-      const jMedia = classifyMedia(parseMarkdownMedia(md));
-      if (media) {
-        media.videos = media.videos.length ? media.videos : jMedia.videos;
-        media.photos = media.photos.length ? media.photos : jMedia.photos;
-        media.zips = media.zips.length ? media.zips : jMedia.zips;
-      } else {
-        media = { ...jMedia, ogImage: null };
-      }
-      channel = channel || info.channel;
+  // path 1: jina reader first — CORS-reflecting, usually resolves in <1s, no proxy-outage dependency
+  let media = null, channel = null, title = null, reachedTelegram = false;
+  const md = await fetchViaJina(embedUrl);
+  if (md) {
+    reachedTelegram = true;
+    channel = info.channel;
+    const jMedia = classifyMedia(parseMarkdownMedia(md));
+    if (jMedia.videos.length || jMedia.photos.length || jMedia.zips.length) {
+      media = { ...jMedia, ogImage: null };
     }
   }
 
-  const got = media && (media.videos.length || media.photos.length || media.zips.length);
-  if (!media || !got) {
-    tgBody.innerHTML = `<p class="status ${html ? "warn" : "err"}">${
-      html
+  // path 2: HTML widget via generic proxies — richer data, slower & flakier
+  if (!media) {
+    const html = await fetchViaProxy(embedUrl);
+    if (html) {
+      reachedTelegram = true;
+      const ogImage = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1];
+      const telesco = [...new Set([...html.matchAll(/(?:src|href)="(https:\/\/cdn[^"]*telesco\.pe\/file\/[^"]+)"/g)].map((m) => decodeEntities(m[1])))];
+      channel = (html.match(/tg:\/\/resolve\?domain=([A-Za-z0-9_]+)/) || [])[1] || info.channel;
+      title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
+      const hMedia = classifyMedia([
+        ...telesco,
+        ...(ogImage ? [ogImage] : []),
+        ...[...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))],
+        ...[...new Set([...html.matchAll(/(?:src|href)="(https?:\/\/[^"]+\.(?:mp4|mkv|webm|mov|jpe?g|png))/gi)].map((m) => decodeEntities(m[1])))],
+      ]);
+      if (hMedia.videos.length || hMedia.photos.length || hMedia.zips.length) {
+        media = { ...hMedia, ogImage };
+      } else {
+        media = { videos: [], photos: [], zips: [], ogImage }; // reached Telegram but nothing visible
+      }
+    }
+  }
+
+  const anyHit = media && (media.videos.length || media.photos.length || media.zips.length || media.ogImage);
+  if (!media || !anyHit) {
+    tgBody.innerHTML = `<p class="status ${reachedTelegram ? "warn" : "err"}">${
+      reachedTelegram
         ? `Reached Telegram, but this post's media is not exposed by Telegram's web preview.\n\nℹ️ <b>Why?</b> Telegram only serves attachment files (videos, big files sent as documents) to the signed-in Telegram client API, not to anonymous web visitors. Photos and caption links are visible; attachments are not.\n\n✅ If the post has a .zip link (Google Drive, Dropbox, GitHub…), paste that here instead — ZipStream streams it directly.`
         : `Couldn't reach Telegram's web preview through any proxy right now (free public CORS proxies are offline/rate-limited — this is temporary, try again in a few minutes).\n\nℹ️ Even when reachable, Telegram never exposes attachment files to anonymous web visitors — videos/documents need the Telegram API with a login.`
     }</p>`;
