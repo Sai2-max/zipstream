@@ -1,0 +1,531 @@
+/* ============================================================
+   ZipStream — play a single file out of a hosted ZIP remotely.
+   Reads the ZIP central directory over HTTP Range requests and
+   downloads ONLY the byte-span of the chosen file.
+   ============================================================ */
+"use strict";
+
+/* ---------------- constants ---------------- */
+const EOCD_SIG = 0x06054b50;
+const CEN_SIG = 0x02014b50;
+const LOC_SIG = 0x04034b50;
+const ZIP64_EOCD_SIG = 0x06064b50;
+const ZIP64_LOC_SIG = 0x07064b50;
+const CHUNK = 4 * 1024 * 1024; // 4 MB download chunks
+const MAX_CD_SIZE = 64 * 1024 * 1024; // sanity cap for central directory
+
+/* ---------------- DOM ---------------- */
+const $ = (id) => document.getElementById(id);
+const urlInput = $("urlInput"), loadBtn = $("loadBtn"), proxyMode = $("proxyMode");
+const statusEl = $("status"), progressWrap = $("progressWrap"), progressBar = $("progressBar");
+const progressText = $("progressText"), cancelBtn = $("cancelBtn");
+const zipNameEl = $("zipName"), zipMetaEl = $("zipMeta"), fileListEl = $("fileList");
+const filesCard = $("filesCard"), tgCard = $("tgCard"), tgBody = $("tgBody");
+const playerCard = $("playerCard"), player = $("player"), playerTitle = $("playerTitle"), fetchMeta = $("fetchMeta");
+
+let currentAbort = null;
+
+/* ---------------- logging / status ---------------- */
+function setStatus(text, kind) {
+  statusEl.hidden = false;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+  statusEl.textContent = text;
+}
+function setProgress(show, pct, text) {
+  progressWrap.hidden = !show;
+  if (show) {
+    progressBar.style.width = (pct || 0) + "%";
+    progressText.textContent = text || "";
+  }
+}
+
+/* ============================================================
+   Range fetch layer with fallback chain
+   ============================================================ */
+const PROXY_BUILDERS = {
+  "corsproxy.io": (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+  "allorigins": (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  "cors.workers.dev": (u) => "https://test.cors.workers.dev/?u=" + encodeURIComponent(u),
+  "isomorphic-git": (u) => "https://cors.isomorphic-git.org/" + u,
+};
+
+function modeList() {
+  const mode = proxyMode.value;
+  if (mode === "direct") return [null];
+  if (mode === "auto") return [null, "corsproxy.io", "allorigins", "cors.workers.dev", "isomorphic-git"];
+  const list = [null, mode];
+  return [...new Set(list)]; // dedupe (direct mode excluded above)
+}
+
+function totalFromContentRange(cr) {
+  const m = cr && cr.match(/\/(\d+| \*)\s*$/);
+  if (!m || m[1] === "*") return null;
+  return parseInt(m[1], 10);
+}
+
+/** Probe candidates: which one answers 206 with a known total size? */
+async function probe(url) {
+  const candidates = modeList();
+  for (const key of candidates) {
+    const target = key ? PROXY_BUILDERS[key](url) : url;
+    try {
+      const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
+      if (!r.ok) continue;
+      const cr = r.headers.get("content-range");
+      let total = totalFromContentRange(cr);
+      if (r.status === 206 && total) {
+        return { key, total };
+      }
+      if (r.status === 200 && r.headers.get("content-range")) {
+        // some proxies answer 200 but forward content-range (full body) — keep as last resort
+        if (total) return { key, total };
+      }
+    } catch (e) { /* next candidate */ }
+  }
+  return null;
+}
+
+/** Chosen fetcher state after probe */
+let conn = null; // { key, total, url }
+
+/** Fetch a byte range as Uint8Array using the chosen connection, with one fallback retry. */
+async function getBytes(start, length, signal) {
+  const candidates = modeList();
+  // try chosen first, then remaining candidates
+  const order = conn && conn.key
+    ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
+    : candidates;
+  let lastErr = null;
+  for (const key of order) {
+    const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
+    const need = Math.min(length, conn.total - start);
+    if (need <= 0) return new Uint8Array(0);
+    try {
+      const r = await fetch(target, {
+        headers: { Range: `bytes=${start}-${start + need - 1}` },
+        signal,
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const buf = new Uint8Array(await r.arrayBuffer());
+      if (buf.byteLength === 0) throw new Error("empty response");
+      return buf;
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      lastErr = e;
+    }
+  }
+  throw new Error("Range fetch failed: " + (lastErr && lastErr.message));
+}
+
+/* ============================================================
+   Remote ZIP reader (EOCD + ZIP64 + central directory)
+   ============================================================ */
+class RemoteZip {
+  constructor() {
+    this.entries = [];
+    this.comment = null;
+  }
+
+  async open(progressCb, signal) {
+    const total = conn.total;
+    if (!total || total < 22) throw new Error("Cannot determine ZIP size from the server.");
+
+    // 1) locate End Of Central Directory in the file tail
+    const tailLen = Math.min(66 * 1024, total);
+    progressCb && progressCb(0.02);
+    const tail = await getBytes(total - tailLen, tailLen, signal);
+    const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+    let eocdIdx = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (dv.getUint32(i, true) === EOCD_SIG) { eocdIdx = i; break; }
+    }
+    if (eocdIdx < 0) {
+      throw new Error("Not a ZIP file (no End-Of-Central-Directory found).");
+    }
+    let cdCount = dv.getUint16(eocdIdx + 10, true);
+    let cdSize = dv.getUint32(eocdIdx + 12, true);
+    let cdOff = dv.getUint32(eocdIdx + 16, true);
+    const nLen = dv.getUint16(eocdIdx + 20, true);
+    this.comment = nLen ? new TextDecoder().decode(tail.subarray(eocdIdx + 22, eocdIdx + 22 + nLen)) : null;
+
+    // 2) ZIP64 support
+    if (cdCount === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff) {
+      const locIdx = eocdIdx - 20;
+      if (locIdx >= 0 && dv.getUint32(locIdx, true) === ZIP64_LOC_SIG) {
+        const z64Off = bigIntFromPair(dv, locIdx + 8);
+        const rec = await getBytes(z64Off, 56, signal);
+        const rd = new DataView(rec.buffer, rec.byteOffset, rec.byteLength);
+        if (rd.getUint32(0, true) === ZIP64_EOCD_SIG) {
+          cdCount = rd.getUint32(32, true);
+          cdSize = bigIntFromPair(rd, 40);
+          cdOff = bigIntFromPair(rd, 48);
+        }
+      }
+    }
+    if (cdSize > MAX_CD_SIZE) throw new Error("Central directory too large (" + fmtBytes(cdSize) + ").");
+    progressCb && progressCb(0.08);
+
+    // 3) fetch + parse the central directory
+    const cd = await getAllBytes(cdOff, cdSize, (frac) => progressCb && progressCb(0.08 + frac * 0.9), signal);
+    parseCentralDirectory.call(this, cd, cdCount, cdOff);
+    progressCb && progressCb(1);
+    return this.entries;
+  }
+}
+
+function bigIntFromPair(dv, off) {
+  const hi = dv.getUint32(off, true);
+  const lo = dv.getUint32(off + 4, true);
+  return hi * 4294967296 + lo;
+}
+
+/** Parse central directory records from a Uint8Array (relative offsets = absolute − cdOffBase). */
+function parseCentralDirectory(cd, count, cdAbsOffset) {
+  const dv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+  const td = new TextDecoder();
+  let p = 0;
+  for (let n = 0; n < count && p + 46 <= cd.length; n++) {
+    if (dv.getUint32(p, true) !== CEN_SIG) break;
+    const flags = dv.getUint16(p + 8, true);
+    const method = dv.getUint16(p + 10, true);
+    const compSizeR = dv.getUint32(p + 20, true);
+    const uncompSizeR = dv.getUint32(p + 24, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+    const lhoR = dv.getUint32(p + 42, true);
+
+    const name = decodeName(td, cd.subarray(p + 46, p + 46 + nameLen), flags);
+    let compSize = compSizeR, uncompSize = uncompSizeR, lo = lhoR;
+    // zip64 extra field
+    if (compSizeR === 0xffffffff || uncompSizeR === 0xffffffff || lhoR === 0xffffffff) {
+      let e = p + 46 + nameLen;
+      const eEnd = e + extraLen;
+      while (e + 4 <= eEnd) {
+        const id = dv.getUint16(e, true);
+        const sz = dv.getUint16(e + 2, true);
+        if (id === 0x0001) {
+          let q = e + 4;
+          if (uncompSizeR === 0xffffffff) { uncompSize = bigIntFromPair(dv, q); q += 8; }
+          if (compSizeR === 0xffffffff) { compSize = bigIntFromPair(dv, q); q += 8; }
+          if (lhoR === 0xffffffff) { lo = bigIntFromPair(dv, q); q += 8; }
+          break;
+        }
+        e += 4 + sz;
+      }
+    }
+    const comment = commentLen
+      ? decodeName(td, cd.subarray(p + 46 + nameLen + extraLen, p + 46 + nameLen + extraLen + commentLen), flags)
+      : "";
+
+    this.entries.push({ name, method, flags, compSize, uncompSize, localOffset: lo, comment });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  if (!this.entries.length) throw new Error("ZIP index parsed but it has 0 entries (encrypted or non-standard ZIP?).");
+}
+
+function decodeName(td, bytes, flags) {
+  const utf8 = (flags & 0x0800) !== 0;
+  if (utf8) return td.decode(bytes);
+  // Windows codepage fallback (approximate via windows-1252)
+  try { return new TextDecoder("windows-1252").decode(bytes); }
+  catch (e) { return td.decode(bytes); }
+}
+
+/** Sequential chunked fetch of a large span, calling back with progress. */
+async function getAllBytes(start, length, onFrac, signal) {
+  const out = new Uint8Array(length);
+  let pos = 0;
+  while (pos < length) {
+    const n = Math.min(CHUNK, length - pos);
+    const chunk = await getBytes(start + pos, n, signal);
+    out.set(chunk, pos);
+    pos += n;
+    onFrac && onFrac(pos / length);
+  }
+  return out;
+}
+
+/* ============================================================
+   Playback: stream just the chosen entry, inflate if needed
+   ============================================================ */
+function extType(name) {
+  const ext = name.split(".").pop().toLowerCase();
+  const map = {
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/mp4",
+    webm: "video/webm", mkv: "video/x-matroska",
+    mp3: "audio/mpeg", m4a: "audio/mp4", opus: "audio/ogg", ogg: "audio/ogg",
+    jpg: "image/jpeg", png: "image/png",
+  };
+  return map[ext] || null;
+}
+function isPlayable(name) { const t = extType(name); return !!t && /^video|audio/.test(t); }
+
+let lastObjectURL = null;
+function revokeLast() { if (lastObjectURL) { URL.revokeObjectURL(lastObjectURL); lastObjectURL = null; } }
+
+async function playEntry(entry) {
+  playerCard.hidden = false;
+  playerCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  playerTitle.textContent = entry.name;
+  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
+  revokeLast();
+  player.src = "";
+  loadBtn.disabled = true;
+  const signal = new AbortController();
+  currentAbort = signal;
+
+  try {
+    // resolve local header → exact data offset
+    const sigLoc = await getBytes(entry.localOffset, 30, signal.signal);
+    const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
+    if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
+    const lNameLen = ldv.getUint16(26, true);
+    const lExtraLen = ldv.getUint16(28, true);
+    const dataOff = entry.localOffset + 30 + lNameLen + lExtraLen;
+
+    const t0 = performance.now();
+    const chunks = [];
+    let got = 0;
+
+    if (entry.method === 0) {
+      // stored: fetch in sequential chunks and assemble
+      let pos = 0;
+      while (pos < entry.compSize) {
+        const n = Math.min(CHUNK, entry.compSize - pos);
+        const c = await getBytes(dataOff + pos, n, signal.signal);
+        chunks.push(c);
+        pos += c.byteLength;
+        got = pos;
+        const frac = got / entry.compSize;
+        const speed = got / ((performance.now() - t0) / 1000);
+        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
+      }
+    } else if (entry.method === 8) {
+      // deflate: fetch compressed chunks, stream-inflate while downloading
+      const ds = new DecompressionStream("deflate-raw");
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      const readAll = (async () => {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+      })();
+      let pos = 0;
+      while (pos < entry.compSize) {
+        const n = Math.min(CHUNK, entry.compSize - pos);
+        const c = await getBytes(dataOff + pos, n, signal.signal);
+        await writer.write(c);
+        pos += c.byteLength;
+        const frac = pos / entry.compSize;
+        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
+      }
+      await writer.close();
+      await readAll;
+      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
+    } else {
+      throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
+    }
+
+    const came = chunks.reduce((s, c) => s + c.byteLength, 0);
+    const blob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
+    lastObjectURL = URL.createObjectURL(blob);
+    player.src = lastObjectURL;
+    player.play().catch(() => {});
+    const secs = (performance.now() - t0) / 1000;
+    setProgress(false);
+    setStatus(
+      `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
+      (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
+      ` — the ZIP stayed on the server.`,
+      "ok"
+    );
+  } catch (e) {
+    setProgress(false);
+    if (e.name === "AbortError") setStatus("Cancelled.", "warn");
+    else setStatus("❌ Playback failed: " + e.message + (String(e.message).includes("DecompressionStream") ? "\nYour browser lacks DecompressionStream — use a current Chrome/Edge/Firefox." : ""), "err");
+  } finally {
+    loadBtn.disabled = false;
+    currentAbort = null;
+  }
+}
+
+/* ============================================================
+   Zip64 guard for BigInt ops above (kept simple)
+   ============================================================ */
+
+/* ============================================================
+   Telegram resolver (best-effort via public web preview)
+   ============================================================ */
+function parseTelegramLink(url) {
+  const m = String(url).match(/(?:t\.me|telegram\.me)\/(?:s\/)?([A-Za-z0-9_]{4,})(?:\/(\d+))?/i);
+  if (!m) return null;
+  return { channel: m[1], post: m[2] ? parseInt(m[2], 10) : null };
+}
+
+async function fetchViaProxy(u) {
+  const candidates = ["allorigins", "corsproxy.io", "cors.workers.dev", "isomorphic-git"];
+  for (const key of candidates) {
+    try {
+      const r = await fetch(PROXY_BUILDERS[key](u));
+      if (r.ok) return await r.text();
+    } catch (e) { /* next */ }
+  }
+  return null;
+}
+
+function decodeEntities(s) {
+  return s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
+async function handleTelegram(text) {
+  const info = parseTelegramLink(text);
+  tgCard.hidden = false;
+  tgBody.innerHTML = "<p class='note'>Resolving Telegram post…</p>";
+  const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}?embed=1&mode=tme`;
+  const html = await fetchViaProxy(target);
+  if (!html) {
+    tgBody.innerHTML = `<p class="status err">Couldn't reach Telegram's web preview through any proxy. Private channels and some media can't be shown from the web.</p>`;
+    return;
+  }
+  const ogImage = (html.match(/<meta property="og:image" content="([^"]+)"/) || [])[1];
+  const telesco = [...new Set([...html.matchAll(/(?:src|href)="(https:\/\/cdn[^"]*telesco\.pe\/file\/[^"]+)"/g)].map((m) => decodeEntities(m[1])))];
+  const videos = telesco.filter((u) => /\.(mp4|mkv|webm|mov)(\?|$)/i.test(u));
+  const photos = telesco.filter((u) => /\.(jpg|jpeg|png)/i.test(u));
+  const zips = [...new Set([...html.matchAll(/(https?:\/\/[^\s"'<>&]+\.zip)/gi)].map((m) => decodeEntities(m[1])))];
+  const title = (html.match(/<meta property="og:title" content="([^"]*)"/) || [])[1] || null;
+
+  let htmlOut = `<p class="note">Channel: <b>@${info.channel}</b>${info.post ? ` · post #${info.post}` : ""}${title ? ` · ${title}` : ""}</p>`;
+
+  if (videos.length) {
+    htmlOut += `<p>🎬 Found ${videos.length} playable media file(s) in the web preview:</p>`;
+    videos.forEach((v, i) => { htmlOut += `<div class="row"><button class="ghost" data-videourl="${v}">▶ Stream video #${i + 1}</button></div>`; });
+  } else if (photos.length || ogImage) {
+    const img = photos[0] || ogImage;
+    htmlOut += `<p>🖼️ This Telegram post contains a <b>photo</b>. Telegram serves the image via its CDN preview:</p><img class="tg-thumb" src="${img}" alt="Telegram post image">`;
+  } else if (zips.length) {
+    htmlOut += `<p>📦 Found a .zip link in the post — open it in ZipStream:</p>`;
+    zips.forEach((z) => { htmlOut += `<div class="row"><button class="ghost" data-zipurl="${z}">📦 ${z}</button></div>`; });
+  } else {
+    htmlOut += `<p class="status warn">This post has no media exposed through Telegram's public web preview.\n\nℹ️ <b>Why can't videos from Telegram be streamed?</b> Telegram only serves file contents to the signed-in Telegram client API (bot or user session), not to anonymous web visitors. A pure browser app can stream photos and anything linked in the caption, but video attachments require a Telegram Bot/User API backend.\n\n✅ For ZIP files from Telegram, download-aware hosting (Google Drive, Dropbox, GitHub, any web server) works directly — paste its link above.</p>`;
+  }
+  tgBody.innerHTML = htmlOut;
+  tgBody.querySelectorAll("[data-videourl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.videourl; load().then(playDirect); }));
+  tgBody.querySelectorAll("[data-zipurl]").forEach((b) => b.addEventListener("click", () => { urlInput.value = b.dataset.zipurl; load(); }));
+}
+
+/** Quick-player for a direct video URL (no ZIP involved). */
+function playDirect() {
+  const url = urlInput.value.trim();
+  if (!/\.(mp4|mkv|webm|mov|m4v)(\?|$)/i.test(url)) { setStatus("That doesn't look like a direct video file URL.", "err"); return; }
+  playerCard.hidden = false;
+  playerTitle.textContent = url.split("/").pop();
+  fetchMeta.textContent = "Direct video streaming";
+  revokeLast();
+  player.src = url;
+  player.play().catch(() => {});
+  filesCard.hidden = true;
+  tgCard.hidden = true;
+  setStatus("Playing the video directly (streamed with range requests by your browser).", "ok");
+}
+
+/* ============================================================
+   Main flow
+   ============================================================ */
+async function load() {
+  const url = urlInput.value.trim();
+  if (!url) { setStatus("Paste a link first.", "err"); return; }
+
+  filesCard.hidden = true; tgCard.hidden = true; revokeLast(); player.src = "";
+  loadBtn.disabled = true;
+
+  try {
+    if (parseTelegramLink(url)) {
+      await handleTelegram(url);
+      return;
+    }
+    setStatus("Connecting…");
+    const p = await probe(url);
+    if (!p) {
+      setStatus(
+        "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
+        "The file host must return 206 Partial Content (Google Drive viewer URLs, for example, don't).\n" +
+        "Try a different mode in the Connection dropdown, or a direct link to the .zip file (Zoom-in on hosts like GitHub raw, Dropbox, any web server).",
+        "err"
+      );
+      return;
+    }
+    conn = { key: p.key, total: p.total, url };
+    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Reading ZIP index…`);
+
+    const zip = new RemoteZip();
+    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`));
+
+    filesCard.hidden = false;
+    zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
+    zipMetaEl.textContent = `${entries.length} files · total ZIP size ${fmtBytes(conn.total)}`;
+    renderEntries(entries);
+    // sort: playable first
+    const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
+    renderEntries(sorted);
+    setProgress(false);
+    setStatus(`✅ Read the ZIP index: ${entries.length} files. Pick a video — only its bytes will be downloaded.`, "ok");
+  } catch (e) {
+    setProgress(false);
+    setStatus("❌ " + e.message, "err");
+  } finally {
+    loadBtn.disabled = false;
+  }
+}
+
+function renderEntries(entries) {
+  fileListEl.innerHTML = "";
+  for (const e of entries) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "fname";
+    name.textContent = e.name;
+    li.appendChild(name);
+    const sz = document.createElement("span");
+    sz.className = "badge";
+    sz.textContent = fmtBytes(e.uncompSize || e.compSize);
+    li.appendChild(sz);
+    const comp = document.createElement("span");
+    comp.className = "badge" + (e.method === 8 ? " deflate" : "");
+    comp.textContent = e.method === 0 ? "stored" : e.method === 8 ? "deflated" : "method " + e.method;
+    li.appendChild(comp);
+    if (isPlayable(e.name)) {
+      li.querySelector(".badge").classList.add("playable");
+      const btn = document.createElement("button");
+      btn.className = "playbtn";
+      btn.textContent = "▶ Play";
+      btn.addEventListener("click", () => playEntry(e));
+      li.appendChild(btn);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "not a video";
+      li.appendChild(badge);
+    }
+    fileListEl.appendChild(li);
+  }
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return "?";
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 2 : 1) + " " + u[i];
+}
+
+/* ---------------- wiring ---------------- */
+loadBtn.addEventListener("click", load);
+urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
+$("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/main/demo.zip"; load(); });
+$("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/main/demo2.zip"; load(); });
+$("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });

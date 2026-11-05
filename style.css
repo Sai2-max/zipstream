@@ -1,0 +1,126 @@
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #9198a1;
+  --accent: #7c3aed;
+  --accent-2: #a78bfa;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 70% -10%, #1d2333 0%, var(--bg) 60%);
+  color: var(--text);
+  font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+header { padding: 28px 20px 6px; max-width: 880px; margin: 0 auto; }
+.brand { display: flex; gap: 14px; align-items: center; }
+.logo { font-size: 40px; filter: drop-shadow(0 0 12px rgba(124, 58, 237, .7)); }
+h1 { margin: 0; font-size: 26px; letter-spacing: .3px; }
+.tagline { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; }
+main { max-width: 880px; margin: 14px auto 40px; padding: 0 20px; display: grid; gap: 16px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px 20px;
+}
+h2 { margin: 0 0 10px; font-size: 17px; }
+.row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.hint-row { justify-content: space-between; }
+.hint { color: var(--muted); font-size: 12.5px; }
+input[type="url"] {
+  flex: 1 1 380px;
+  background: #0a0d12;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 11px 13px;
+  font-size: 14px;
+  outline: none;
+}
+input[type="url"]:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(124, 58, 237, .25); }
+button {
+  background: linear-gradient(135deg, var(--accent), #5b21b6);
+  color: #fff;
+  border: 0;
+  border-radius: 10px;
+  padding: 11px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .15s, transform .05s;
+}
+button:hover { filter: brightness(1.15); }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .5; cursor: wait; }
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--accent-2);
+  font-weight: 500;
+}
+button.mini { padding: 5px 12px; font-size: 12px; border-radius: 8px; }
+select {
+  background: #0a0d12;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+}
+.status {
+  margin-top: 12px;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 13.5px;
+  border: 1px solid var(--border);
+  background: #0a0d12;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.status.ok { border-color: rgba(63, 185, 80, .5); }
+.status.err { border-color: rgba(248, 81, 73, .6); }
+.status.warn { border-color: rgba(210, 153, 34, .55); }
+.progress-wrap { margin-top: 12px; display: flex; align-items: center; gap: 12px; }
+.progress { flex: 1; height: 8px; background: #0a0d12; border-radius: 99px; overflow: hidden; border: 1px solid var(--border); }
+#progressBar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .2s; }
+#progressText { font-size: 12.5px; color: var(--muted); min-width: 130px; text-align: right; }
+.files-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.meta { color: var(--muted); font-size: 12.5px; }
+ul#fileList { list-style: none; margin: 8px 0 0; padding: 0; }
+ul#fileList li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+ul#fileList li:last-child { border-bottom: 0; }
+ul#fileList .fname { flex: 1; word-break: break-all; }
+.badge {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.playable { color: var(--ok); border-color: rgba(63, 185, 80, .45); }
+.badge.deflate { color: var(--accent-2); }
+.playbtn { padding: 7px 16px; font-size: 13px; }
+video { width: 100%; border-radius: 10px; background: #000; max-height: 480px; }
+.note { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+.tip { color: var(--accent-2); }
+details summary { cursor: pointer; color: var(--accent-2); }
+details p { color: var(--muted); font-size: 13.5px; }
+footer { text-align: center; color: var(--muted); font-size: 12px; padding: 10px 20px 30px; }
+footer a { color: var(--accent-2); }
+a { color: var(--accent-2); }
+#tgBody img.tg-thumb { max-width: 320px; border-radius: 10px; border: 1px solid var(--border); display: block; margin-top: 10px; }
+.demo-card p { color: var(--muted); font-size: 13.5px; margin-top: 0; }

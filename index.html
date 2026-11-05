@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZipStream — Play videos straight out of a remote ZIP</title>
+<meta name="description" content="Paste a link to a hosted ZIP file and play a single video from it without downloading the whole ZIP. Works over HTTP Range requests + on-the-fly inflate.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">⚡</span>
+    <div>
+      <h1>ZipStream</h1>
+      <p class="tagline">Play one video straight out of a big remote ZIP — no full download, no extraction.</p>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <label for="urlInput"><strong>Paste a ZIP link</strong> (https://.../file.zip) or a Telegram post link (t.me/channel/123)</label>
+    <div class="row">
+      <input id="urlInput" type="url" placeholder="https://example.com/movies.zip  |  https://t.me/channel/13" spellcheck="false">
+      <button id="loadBtn">Open</button>
+    </div>
+    <div class="row hint-row">
+      <span class="hint">Server must support <b>HTTP Range requests</b> (almost all CDNs do).</span>
+      <select id="proxyMode" title="Connection mode — try Auto first">
+        <option value="auto" selected>Connection: Auto (direct → proxy fallback)</option>
+        <option value="direct">Connection: Direct only</option>
+        <option value="corsproxy.io">Connection: Proxy — corsproxy.io</option>
+        <option value="allorigins">Connection: Proxy — allorigins</option>
+        <option value="cors.workers.dev">Connection: Proxy — cors.workers.dev</option>
+        <option value="isomorphic-git">Connection: Proxy — isomorphic-git</option>
+      </select>
+    </div>
+    <div id="status" class="status" hidden></div>
+    <div id="progressWrap" class="progress-wrap" hidden>
+      <div class="progress"><div id="progressBar"></div></div>
+      <span id="progressText"></span>
+      <button id="cancelBtn" class="mini">Cancel</button>
+    </div>
+  </section>
+
+  <section class="card" id="tgCard" hidden>
+    <h2>Telegram result</h2>
+    <div id="tgBody"></div>
+  </section>
+
+  <section class="card" id="filesCard" hidden>
+    <div class="files-head">
+      <h2>Contents of <span id="zipName"></span></h2>
+      <span id="zipMeta" class="meta"></span>
+    </div>
+    <ul id="fileList"></ul>
+    <p class="note tip" id="demoTip">Tip: videos whose full entry is fetched are cached as a Blob, so replay and seeking are instant.</p>
+  </section>
+
+  <section class="card" id="playerCard" hidden>
+    <h2 id="playerTitle"></h2>
+    <video id="player" controls controlslist="fullscreen" playsinline preload="metadata"></video>
+    <div class="meta" id="fetchMeta"></div>
+  </section>
+
+  <section class="card demo-card">
+    <h2>No ZIP link handy?</h2>
+    <p>Try the built-in demo, hosted on GitHub (supports Range + CORS):</p>
+    <div class="row">
+      <button class="ghost" id="demoBtn1">▶ Demo: 2 sample clips (stored/uncompressed)</button>
+      <button class="ghost" id="demoBtn2">▶ Demo: 2 sample clips (deflated/compressed)</button>
+      <button class="ghost" id="demoTgBtn">Try the Telegram test link</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary><b>How does this work without extracting the whole ZIP?</b></summary>
+      <p>Every ZIP stores a small <i>central directory</i> (index) at its end. ZipStream downloads only that index (a few KB) using a
+      <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests" target="_blank" rel="noopener">Range request</a>,
+      lists the files inside, then downloads <i>only the byte span of the file you picked</i>. Uncompressed entries play directly;
+      deflated entries are re-inflated in your browser on the fly (<code>DecompressionStream</code>) — you still never download the whole ZIP.</p>
+      <p><b>Telegram:</b> t.me links are resolved through Telegram's public web preview. Photo posts and direct file links resolve fully.
+      Videos posted as Telegram media can't be streamed from the web preview (they require the Telegram client API, which needs a login/bot token) — the app will tell you what it could and couldn't get.</p>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <span>Built for servers big and small · <a href="https://github.com/Sai2-max/zipstream" target="_blank" rel="noopener">GitHub repo</a> · client-side only — none of your data is uploaded anywhere.</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
