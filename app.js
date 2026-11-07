@@ -385,7 +385,8 @@ function startStream(entry, dataOff) {
     : "Streaming (deflated entry) — inflating in a Service Worker; seek within already-loaded data";
   setProgress(false);
   const url = virtualUrl(entry, dataOff);
-  player.onerror = () => {
+  
+  const handleError = () => {
     if (!streamActive) return;
     streamActive = false;
     player.onerror = null;
@@ -393,8 +394,15 @@ function startStream(entry, dataOff) {
     setStatus("Streaming failed — retrying with full-entry download…", "warn");
     playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
   };
+  
+  player.onerror = handleError;
   player.src = url;
-  player.play().catch(() => {});
+  player.play().catch((e) => {
+    // Codec not supported often throws here, not via onerror
+    if (e.name === "NotSupportedError" || e.name === "MediaError") {
+      handleError();
+    }
+  });
   setStatus(`▶ Streaming "${entry.name}" — the browser fetches only the byte ranges it needs; the ZIP stays on the server.`, "ok");
 }
 
@@ -462,7 +470,7 @@ async function playEntryBlob(entry, dataOff, signal) {
 
   // Add download button for fallback (useful for HEVC/codec issues)
   const dlBtn = document.createElement("button");
-  dlBtn.className = "playbtn";
+  dlBtn.className = "playbtn dl-btn";
   dlBtn.textContent = "⬇ Download entry";
   dlBtn.style.marginLeft = "8px";
   dlBtn.onclick = () => {
@@ -471,10 +479,9 @@ async function playEntryBlob(entry, dataOff, signal) {
     a.download = entry.name;
     a.click();
   };
-  // Insert after the player or in fetchMeta area
+  // Insert in fetchMeta area
   const metaEl = fetchMeta;
   if (metaEl && !metaEl.querySelector(".dl-btn")) {
-    dlBtn.classList.add("dl-btn");
     metaEl.appendChild(document.createTextNode(" "));
     metaEl.appendChild(dlBtn);
   }
