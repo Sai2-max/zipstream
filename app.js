@@ -62,16 +62,18 @@ function modeList() {
  * Proves honest Range support via the 206 status; the Content-Range
  * header is often hidden by CORS and is never relied on.
  */
-async function probe(url) {
+async function probe(url, signal) {
   const candidates = modeList();
   for (const key of candidates) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
-      const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
+      const r = await fetch(target, { headers: { Range: "bytes=0-1" }, signal });
       if (r.status !== 206) continue; // 200 → server ignores Range; anything else → broken
       const buf = new Uint8Array(await r.arrayBuffer());
       if (buf.byteLength >= 1) return { key };
-    } catch (e) { /* next candidate */ }
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+    }
   }
   return null;
 }
@@ -213,8 +215,8 @@ class RemoteZip {
 }
 
 function bigIntFromPair(dv, off) {
-  const hi = dv.getUint32(off, true);
-  const lo = dv.getUint32(off + 4, true);
+  const lo = dv.getUint32(off, true);       // low 32 bits (first 4 bytes, little-endian)
+  const hi = dv.getUint32(off + 4, true);   // high 32 bits (next 4 bytes)
   return hi * 4294967296 + lo;
 }
 
@@ -443,6 +445,19 @@ function parseMarkdownMedia(md) {
   return [...urls];
 }
 
+/** Classify media URLs into videos / photos / zips by extension. */
+function classifyMedia(urls) {
+  const videos = [], photos = [], zips = [];
+  for (const u of urls) {
+    const ext = u.split("?")[0].split(".").pop().toLowerCase();
+    if (ext === "zip") zips.push(u);
+    else if (["mp4", "mkv", "webm", "mov", "m4v", "m3u8"].includes(ext)) videos.push(u);
+    else if (["jpg", "jpeg", "png", "webp", "gif", "bmp"].includes(ext)) photos.push(u);
+    else videos.push(u); // unknown → treat as potential video
+  }
+  return { videos, photos, zips };
+}
+
 function decodeEntities(s) {
   return s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
@@ -552,7 +567,9 @@ async function load() {
       return;
     }
     setStatus("Connecting…");
-    const p = await probe(url);
+    const signal = new AbortController();
+    currentAbort = signal;
+    const p = await probe(url, signal.signal);
     if (!p) {
       setStatus(
         "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
@@ -571,7 +588,6 @@ async function load() {
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
     zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
-    renderEntries(entries);
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
@@ -631,6 +647,7 @@ function fmtBytes(n) {
 loadBtn.addEventListener("click", load);
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
 cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
-$("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo.zip"; load(); });
-$("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo2.zip"; load(); });
+const COMMIT = "3a03758b73870ec9a4747c49fffdef54dc81b57f";
+$("demoBtn1").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${COMMIT}/demo.zip`; load(); });
+$("demoBtn2").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${COMMIT}/demo2.zip`; load(); });
 $("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });
