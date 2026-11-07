@@ -1,7 +1,9 @@
 /* ZipStream Telegram backend — resolves t.me posts and streams their video
-   with HTTP Range support (seekable <video> playback). MTProto user session. */
+   with HTTP Range support (seekable <video> playback). MTProto user session.
+   Includes FFmpeg transcode for HEVC/H.265 → H.264 browser playback. */
 import http from "node:http";
 import bigInt from "big-integer";
+import ffmpeg from "fluent-ffmpeg";
 import { loadEnv, createClient, resolveMedia } from "./common.js";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -171,6 +173,119 @@ async function handleStream(req, res, url) {
   }
 }
 
+/** Transcode endpoint: streams Telegram video through FFmpeg (HEVC → H.264) for browser playback. */
+async function handleTranscode(req, res, url) {
+  const target = url.searchParams.get("url");
+  const entryName = url.searchParams.get("entry"); // for ZIP entries
+  if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
+
+  let meta;
+  try {
+    meta = await getMedia(target);
+  } catch (e) {
+    return sendJson(res, 500, { ok: false, error: e.message });
+  }
+  if (meta.kind === "photo") {
+    return sendJson(res, 400, { ok: false, error: "This post is a photo." });
+  }
+
+  // For ZIP files, we'd need to extract the specific entry first
+  // This version transcodes the whole file (works for direct video posts)
+  if (meta.kind === "file" && !meta.isVideo) {
+    return sendJson(res, 400, { ok: false, error: "Not a video file. Use /api/stream for ZIP entries." });
+  }
+
+  const range = req.headers.range;
+  const totalSize = meta.size;
+
+  // We don't know the output size in advance (transcoding changes it)
+  // So we stream without Content-Length, using chunked transfer
+  res.writeHead(200, {
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    "Transfer-Encoding": "chunked",
+    ...CORS,
+  });
+
+  if (req.method === "HEAD") return res.end();
+
+  // Create a PassThrough stream for FFmpeg output
+  const { PassThrough } = await import("node:stream");
+  const outputStream = new PassThrough();
+
+  // Pipe FFmpeg output to HTTP response
+  outputStream.pipe(res);
+
+  // Handle client disconnect
+  req.on("close", () => {
+    ffmpegProcess?.kill("SIGKILL");
+    outputStream.destroy();
+  });
+
+  let ffmpegProcess = null;
+
+  try {
+    // Create input stream from Telegram
+    const inputStream = new PassThrough();
+
+    // Start FFmpeg: input from Telegram stream, output H.264 MP4
+    ffmpegProcess = ffmpeg(inputStream)
+      .inputOptions([
+        "-analyzeduration", "1000000",  // 1ms analyze
+        "-probesize", "500000",
+        "-fflags", "+genpts",
+      ])
+      .outputOptions([
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",
+        "-level", "3.0",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-flags", "+global_header",
+      ])
+      .on("start", (cmd) => console.log("[transcode] FFmpeg started:", cmd))
+      .on("error", (err) => {
+        console.error("[transcode] FFmpeg error:", err.message);
+        if (!res.writableEnded) res.destroy(err);
+      })
+      .on("end", () => {
+        console.log("[transcode] FFmpeg finished");
+        if (!res.writableEnded) outputStream.end();
+      })
+      .pipe(outputStream, { end: true });
+
+    // Feed Telegram data into FFmpeg input
+    const feedTelegram = async () => {
+      let sent = 0;
+      try {
+        while (sent < totalSize) {
+          const n = Math.min(CHUNK, totalSize - sent);
+          const buf = await fetchRange(meta, sent, n);
+          if (!buf || buf.length === 0) break;
+          inputStream.write(buf);
+          sent += buf.length;
+        }
+        inputStream.end();
+      } catch (e) {
+        console.error("[transcode] feed error:", e.message);
+        inputStream.destroy(e);
+      }
+    };
+
+    feedTelegram();
+
+  } catch (e) {
+    console.error("[transcode] setup error:", e.message);
+    if (!res.writableEnded) res.destroy(e);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   if (req.method === "OPTIONS") {
@@ -189,6 +304,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (u.pathname === "/api/resolve") return handleResolve(req, res, u);
   if (u.pathname === "/api/stream") return handleStream(req, res, u);
+  if (u.pathname === "/api/transcode") return handleTranscode(req, res, u);
   sendJson(res, 404, { ok: false, error: "not found" });
 });
 

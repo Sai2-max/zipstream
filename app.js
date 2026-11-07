@@ -391,8 +391,11 @@ function startStream(entry, dataOff) {
     streamActive = false;
     player.onerror = null;
     player.src = "";
-    setStatus("Streaming failed — retrying with full-entry download…", "warn");
-    playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+    setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
+    playViaTranscode(entry, dataOff).catch(() => {
+      setStatus("Transcode failed — retrying with full-entry download…", "warn");
+      playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+    });
   };
   
   player.onerror = handleError;
@@ -404,6 +407,19 @@ function startStream(entry, dataOff) {
     }
   });
   setStatus(`▶ Streaming "${entry.name}" — the browser fetches only the byte ranges it needs; the ZIP stays on the server.`, "ok");
+}
+
+/** Play via server-side transcode (HEVC → H.264 MP4) */
+async function playViaTranscode(entry, dataOff) {
+  if (!entry.isVideo) return;
+  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(conn.url)}&entry=${encodeURIComponent(entry.name)}`;
+  fetchMeta.textContent = "Transcoding HEVC → H.264 (server-side)…";
+  revokeLast();
+  player.src = "";
+  player.onerror = null;
+  player.src = transcodeUrl;
+  await player.play().catch(() => {});
+  setStatus(`▶ Transcoding "${entry.name}" — server converts HEVC→H.264 for browser playback.`, "ok");
 }
 
 /** Fallback: download the whole entry, inflate if needed, play from a Blob. */
