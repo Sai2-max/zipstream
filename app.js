@@ -474,10 +474,15 @@ async function playEntryBlob(entry, dataOff, signal) {
   dlBtn.textContent = "⬇ Download entry";
   dlBtn.style.marginLeft = "8px";
   dlBtn.onclick = () => {
+    // Create fresh blob from chunks to ensure complete file
+    const dlBlob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
+    const dlUrl = URL.createObjectURL(dlBlob);
     const a = document.createElement("a");
-    a.href = lastObjectURL;
+    a.href = dlUrl;
     a.download = entry.name;
     a.click();
+    // Clean up after a moment
+    setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
   };
   // Insert in fetchMeta area
   const metaEl = fetchMeta;
