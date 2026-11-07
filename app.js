@@ -64,16 +64,18 @@ function modeList() {
  * Proves honest Range support via the 206 status; the Content-Range
  * header is often hidden by CORS and is never relied on.
  */
-async function probe(url) {
+async function probe(url, signal) {
   const candidates = modeList();
   for (const key of candidates) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
-      const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
-      if (r.status !== 206) continue; // 200 → server ignores Range; anything else → broken
+      const r = await fetch(target, { headers: { Range: "bytes=0-1" }, signal });
+      if (r.status !== 206) continue;
       const buf = new Uint8Array(await r.arrayBuffer());
       if (buf.byteLength >= 1) return { key };
-    } catch (e) { /* next candidate */ }
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+    }
   }
   return null;
 }
@@ -232,8 +234,8 @@ class RemoteZip {
 }
 
 function bigIntFromPair(dv, off) {
-  const hi = dv.getUint32(off, true);
-  const lo = dv.getUint32(off + 4, true);
+  const lo = dv.getUint32(off, true);       // low 32 bits (first 4 bytes, little-endian)
+  const hi = dv.getUint32(off + 4, true);   // high 32 bits (next 4 bytes)
   return hi * 4294967296 + lo;
 }
 
@@ -538,7 +540,7 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-const BACKEND = "http://127.0.0.1:8788";
+const BACKEND = "http://127.0.0.1:8787";
 
 /** Try the local MTProto backend first (it can stream real video attachments). */
 async function tryBackendResolve(tgUrl) {
@@ -721,7 +723,9 @@ async function load() {
       return;
     }
     setStatus("Connecting…");
-    const p = await probe(url);
+    const signal = new AbortController();
+    currentAbort = signal;
+    const p = await probe(url, signal.signal);
     if (!p) {
       setStatus(
         "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
@@ -740,7 +744,6 @@ async function load() {
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
     zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
-    renderEntries(entries);
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
@@ -834,8 +837,9 @@ async function initSW() {
 loadBtn.addEventListener("click", load);
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
 cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
-$("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo.zip"; load(); });
-$("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo2.zip"; load(); });
+const DEMO_COMMIT = "2f7ec89f9cd50ac7860706a1375546a428d92287"; // commit where demo.zip files exist
+$("demoBtn1").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${DEMO_COMMIT}/demo.zip`; load(); });
+$("demoBtn2").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${DEMO_COMMIT}/demo2.zip`; load(); });
 $("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });
 
 initSW();
