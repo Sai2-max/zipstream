@@ -459,6 +459,25 @@ async function playEntryBlob(entry, dataOff, signal) {
     ` — the ZIP stayed on the server.`,
     "ok"
   );
+
+  // Add download button for fallback (useful for HEVC/codec issues)
+  const dlBtn = document.createElement("button");
+  dlBtn.className = "playbtn";
+  dlBtn.textContent = "⬇ Download entry";
+  dlBtn.style.marginLeft = "8px";
+  dlBtn.onclick = () => {
+    const a = document.createElement("a");
+    a.href = lastObjectURL;
+    a.download = entry.name;
+    a.click();
+  };
+  // Insert after the player or in fetchMeta area
+  const metaEl = fetchMeta;
+  if (metaEl && !metaEl.querySelector(".dl-btn")) {
+    dlBtn.classList.add("dl-btn");
+    metaEl.appendChild(document.createTextNode(" "));
+    metaEl.appendChild(dlBtn);
+  }
 }
 
 /* ============================================================
@@ -553,7 +572,7 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-const BACKEND = "http://127.0.0.1:8787";
+const BACKEND = "http://localhost:8787";
 
 /** Try the local MTProto backend first (it can stream real video attachments). */
 async function tryBackendResolve(tgUrl) {
