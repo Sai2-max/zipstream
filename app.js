@@ -850,7 +850,7 @@ async function initSW() {
 loadBtn.addEventListener("click", load);
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
 cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
-const DEMO_COMMIT = "2f7ec89f9cd50ac7860706a1375546a428d92287"; // commit where demo.zip files exist
+const DEMO_COMMIT = "8006d7bf52b278d8b6342fa91a2ba219f5bd4c0a"; // current HEAD
 $("demoBtn1").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${DEMO_COMMIT}/demo.zip`; load(); });
 $("demoBtn2").addEventListener("click", () => { urlInput.value = `https://raw.githubusercontent.com/Sai2-max/zipstream/${DEMO_COMMIT}/demo2.zip`; load(); });
 $("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });
