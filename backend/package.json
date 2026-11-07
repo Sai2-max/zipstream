@@ -1,0 +1,15 @@
+{
+  "name": "zipstream-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Telegram streaming backend for ZipStream (MTProto user session)",
+  "scripts": {
+    "login": "node login.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "telegram": "^2.26.0"
+  }
+}

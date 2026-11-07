@@ -37,6 +37,9 @@
         <option value="isomorphic-git">Connection: Proxy — isomorphic-git</option>
       </select>
     </div>
+    <div class="row hint-row">
+      <span class="hint" id="swState">Streaming engine: checking…</span>
+    </div>
     <div id="status" class="status" hidden></div>
     <div id="progressWrap" class="progress-wrap" hidden>
       <div class="progress"><div id="progressBar"></div></div>
@@ -56,7 +59,7 @@
       <span id="zipMeta" class="meta"></span>
     </div>
     <ul id="fileList"></ul>
-    <p class="note tip" id="demoTip">Tip: videos whose full entry is fetched are cached as a Blob, so replay and seeking are instant.</p>
+    <p class="note tip" id="demoTip">Tip: videos stored <b>uncompressed</b> (method "stored") in the ZIP stream with instant start and full seeking. Deflated videos also stream, but seeking is limited to what's been inflated so far.</p>
   </section>
 
   <section class="card" id="playerCard" hidden>
@@ -80,8 +83,12 @@
       <summary><b>How does this work without extracting the whole ZIP?</b></summary>
       <p>Every ZIP stores a small <i>central directory</i> (index) at its end. ZipStream downloads only that index (a few KB) using a
       <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests" target="_blank" rel="noopener">Range request</a>,
-      lists the files inside, then downloads <i>only the byte span of the file you picked</i>. Uncompressed entries play directly;
-      deflated entries are re-inflated in your browser on the fly (<code>DecompressionStream</code>) — you still never download the whole ZIP.</p>
+      lists the files inside, then streams <i>only the byte spans of the file you picked</i>.</p>
+      <p><b>Streaming:</b> a Service Worker exposes each entry as a same-origin "virtual file". When you press Play, the
+      <code>&lt;video&gt;</code> element asks for exactly the byte ranges it needs — a few KB for the header, then more as you watch
+      and whenever you scrub. <b>Stored</b> (uncompressed) entries map 1:1 to ZIP offsets, so seeking is instant and nothing extra is
+      downloaded. <b>Deflated</b> entries are re-inflated on the fly in the worker (<code>DecompressionStream</code>) and stream
+      progressively; a deflate stream has no random access, so seeking far ahead inflates the bytes up to that point.</p>
       <p><b>Telegram:</b> t.me links are resolved through Telegram's public web preview. Photo posts and direct file links resolve fully.
       Videos posted as Telegram media can't be streamed from the web preview (they require the Telegram client API, which needs a login/bot token) — the app will tell you what it could and couldn't get.</p>
     </details>
