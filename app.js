@@ -391,11 +391,17 @@ function startStream(entry, dataOff) {
     streamActive = false;
     player.onerror = null;
     player.src = "";
-    setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
-    playViaTranscode(entry, dataOff).catch(() => {
-      setStatus("Transcode failed — retrying with full-entry download…", "warn");
+    // Only try transcode for direct video URLs (not ZIP entries)
+    if (conn.url.startsWith(BACKEND + "/api/stream")) {
+      setStatus("Transcode not available for ZIP entries — retrying with full-entry download…", "warn");
       playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
-    });
+    } else {
+      setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
+      playViaTranscode(entry, dataOff).catch(() => {
+        setStatus("Transcode failed — retrying with full-entry download…", "warn");
+        playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+      });
+    }
   };
   
   player.onerror = handleError;
@@ -409,10 +415,10 @@ function startStream(entry, dataOff) {
   setStatus(`▶ Streaming "${entry.name}" — the browser fetches only the byte ranges it needs; the ZIP stays on the server.`, "ok");
 }
 
-/** Play via server-side transcode (HEVC → H.264 MP4) */
+/** Play via server-side transcode (HEVC → H.264 MP4) - only for direct video URLs */
 async function playViaTranscode(entry, dataOff) {
   if (!entry.isVideo) return;
-  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(conn.url)}&entry=${encodeURIComponent(entry.name)}`;
+  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(conn.url)}`;
   fetchMeta.textContent = "Transcoding HEVC → H.264 (server-side)…";
   revokeLast();
   player.src = "";
