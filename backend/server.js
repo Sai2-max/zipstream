@@ -1,0 +1,200 @@
+/* ZipStream Telegram backend — resolves t.me posts and streams their video
+   with HTTP Range support (seekable <video> playback). MTProto user session. */
+import http from "node:http";
+import bigInt from "big-integer";
+import { loadEnv, createClient, resolveMedia } from "./common.js";
+
+const PORT = Number(process.env.PORT || 8787);
+const CHUNK = 1024 * 1024;        // 1 MB per HTTP response chunk
+const REQUEST_SIZE = 512 * 1024;  // MTProto GetFile request size (Telegram's max)
+const CACHE_TTL = 10 * 60 * 1000; // keep resolved message (file ref) for 10 min
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Range, Content-Type",
+  "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+};
+
+const env = loadEnv();
+const client = env.TG_API_ID && env.TG_API_HASH ? createClient(env) : null;
+const mediaCache = new Map(); // t.me url -> { resolvedAt, meta }
+
+async function ensureConnected() {
+  if (!client) {
+    throw new Error("Not logged in. Run `npm run login` in the backend folder first.");
+  }
+  if (!client.connected) await client.connect();
+  if (!(await client.checkAuthorization())) {
+    throw new Error("Not logged in. Run `npm run login` in the backend folder first.");
+  }
+  return client;
+}
+
+async function getMedia(url) {
+  const now = Date.now();
+  const cached = mediaCache.get(url);
+  if (cached && now - cached.resolvedAt < CACHE_TTL) return cached.meta;
+  await ensureConnected();
+  const meta = await resolveMedia(client, url);
+  mediaCache.set(url, { resolvedAt: now, meta });
+  return meta;
+}
+
+function parseRange(header, size) {
+  if (!header) return null;
+  const m = header.match(/bytes=(\d*)-(\d*)/);
+  if (!m) return null;
+  let start, end;
+  if (m[1] === "" && m[2] === "") return null;
+  if (m[1] === "") {
+    const n = parseInt(m[2], 10);
+    start = Math.max(0, size - n);
+    end = size - 1;
+  } else {
+    start = parseInt(m[1], 10);
+    end = m[2] === "" ? size - 1 : Math.min(parseInt(m[2], 10), size - 1);
+  }
+  if (start > end || start >= size) return { unsatisfiable: true };
+  return { start, end };
+}
+
+/** Fetch exactly `n` bytes of the media starting at `pos` (fewer at EOF). */
+async function fetchRange(meta, pos, n) {
+  const iter = client.iterDownload({
+    file: meta.media,          // MessageMediaDocument / MessageMediaPhoto
+    offset: bigInt(pos),
+    chunkSize: n,
+    stride: n,
+    limit: 1,
+    requestSize: REQUEST_SIZE,
+  });
+  const parts = [];
+  for await (const c of iter) parts.push(c);
+  return Buffer.concat(parts);
+}
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    ...CORS,
+  });
+  res.end(body);
+}
+
+async function handleResolve(req, res, url) {
+  const target = url.searchParams.get("url");
+  if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
+  try {
+    const meta = await getMedia(target);
+    if (meta.kind === "photo") {
+      return sendJson(res, 200, { ok: true, kind: "photo", title: meta.title });
+    }
+    if (meta.kind === "file") {
+      return sendJson(res, 200, {
+        ok: true,
+        kind: "file",
+        title: meta.title,
+        mime: meta.mime,
+        size: meta.size,
+      });
+    }
+    sendJson(res, 200, {
+      ok: true,
+      kind: "video",
+      title: meta.title,
+      mime: meta.mime,
+      size: meta.size,
+      duration: meta.duration,
+      width: meta.width,
+      height: meta.height,
+      stream: `/api/stream?url=${encodeURIComponent(target)}`,
+    });
+  } catch (e) {
+    sendJson(res, 500, { ok: false, error: e.message });
+  }
+}
+
+async function handleStream(req, res, url) {
+  const target = url.searchParams.get("url");
+  if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
+
+  let meta;
+  try {
+    meta = await getMedia(target);
+  } catch (e) {
+    return sendJson(res, 500, { ok: false, error: e.message });
+  }
+  if (meta.kind === "photo") {
+    return sendJson(res, 400, { ok: false, error: "This post is a photo, not a streamable file." });
+  }
+
+  const size = meta.size;
+  const range = parseRange(req.headers.range, size);
+  if (range && range.unsatisfiable) {
+    res.writeHead(416, { "Content-Range": `bytes */${size}`, ...CORS });
+    return res.end();
+  }
+
+  const start = range ? range.start : 0;
+  const end = range ? range.end : size - 1;
+  const length = end - start + 1;
+  const headers = {
+    "Content-Type": meta.mime,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    "Content-Length": String(length),
+    ...CORS,
+  };
+  if (range) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+
+  res.writeHead(range ? 206 : 200, headers);
+  if (req.method === "HEAD") return res.end();
+
+  let sent = 0;
+  try {
+    while (sent < length) {
+      const n = Math.min(CHUNK, length - sent);
+      const buf = await fetchRange(meta, start + sent, n);
+      if (!buf || buf.length === 0) break;
+      if (!res.write(buf)) {
+        await new Promise((r) => res.once("drain", r));
+      }
+      sent += buf.length;
+    }
+    res.end();
+  } catch (e) {
+    console.error("stream error:", e.message);
+    res.destroy(e);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS);
+    return res.end();
+  }
+  if (u.pathname === "/health") {
+    let authorized = false;
+    if (client) {
+      try {
+        if (!client.connected) await client.connect();
+        authorized = await client.checkAuthorization();
+      } catch (e) { authorized = false; }
+    }
+    return sendJson(res, 200, { ok: true, authorized, needLogin: !authorized });
+  }
+  if (u.pathname === "/api/resolve") return handleResolve(req, res, u);
+  if (u.pathname === "/api/stream") return handleStream(req, res, u);
+  sendJson(res, 404, { ok: false, error: "not found" });
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`ZipStream backend → http://127.0.0.1:${PORT}`);
+  console.log("  /health       status");
+  console.log("  /api/resolve  ?url=https://t.me/channel/123");
+  console.log("  /api/stream   ?url=https://t.me/channel/123  (supports Range)");
+});

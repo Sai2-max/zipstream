@@ -24,6 +24,8 @@ const filesCard = $("filesCard"), tgCard = $("tgCard"), tgBody = $("tgBody");
 const playerCard = $("playerCard"), player = $("player"), playerTitle = $("playerTitle"), fetchMeta = $("fetchMeta");
 
 let currentAbort = null;
+let swReady = false;      // Service Worker controlling this page → seekable streaming on
+let streamActive = false; // current playback is SW streaming (used for error fallback)
 
 /* ---------------- logging / status ---------------- */
 function setStatus(text, kind) {
@@ -82,6 +84,23 @@ async function probe(url) {
  * Cost ≈ 2 × log2(size) one-byte requests.
  */
 async function findSize(signal) {
+  // Fast path: some hosts expose the total via Content-Range / Content-Length
+  // (CORS-permitting). Saves ~2×log2(size) probes on large files.
+  try {
+    const candidates = modeList();
+    for (const key of candidates) {
+      const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
+      const r = await fetch(target, { headers: { Range: "bytes=0-0" }, signal });
+      const cr = r.headers.get("Content-Range"); // e.g. "bytes 0-0/12345"
+      const m = cr && cr.match(/\/(\d+)\s*$/);
+      if (m) return parseInt(m[1], 10);
+      if (r.status === 200) {
+        const cl = r.headers.get("Content-Length");
+        if (cl && parseInt(cl, 10) > 0) return parseInt(cl, 10);
+      }
+    }
+  } catch (e) { /* fall back to binary search below */ }
+
   const probeByte = async (pos) => {
     const candidates = modeList();
     const order = conn && conn.key
@@ -303,84 +322,49 @@ function isPlayable(name) { const t = extType(name); return !!t && /^video|audio
 let lastObjectURL = null;
 function revokeLast() { if (lastObjectURL) { URL.revokeObjectURL(lastObjectURL); lastObjectURL = null; } }
 
+function b64urlEncode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Same-origin virtual URL the Service Worker serves as a seekable file. */
+function virtualUrl(entry, dataOff) {
+  return "__zip__/" + b64urlEncode(conn.url) + "/" + encodeURIComponent(entry.name) +
+    "?o=" + dataOff + "&m=" + entry.method + "&c=" + entry.compSize + "&u=" + entry.uncompSize;
+}
+
+/** Resolve a local header to the exact byte offset where entry data begins. */
+async function resolveDataOff(entry, signal) {
+  const sigLoc = await getBytes(entry.localOffset, 30, signal);
+  const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
+  if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
+  const lNameLen = ldv.getUint16(26, true);
+  const lExtraLen = ldv.getUint16(28, true);
+  return entry.localOffset + 30 + lNameLen + lExtraLen;
+}
+
 async function playEntry(entry) {
   playerCard.hidden = false;
   playerCard.scrollIntoView({ behavior: "smooth", block: "start" });
   playerTitle.textContent = entry.name;
-  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
   revokeLast();
   player.src = "";
+  player.onerror = null;
+  streamActive = false;
   loadBtn.disabled = true;
   const signal = new AbortController();
   currentAbort = signal;
 
   try {
-    // resolve local header → exact data offset
-    const sigLoc = await getBytes(entry.localOffset, 30, signal.signal);
-    const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
-    if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
-    const lNameLen = ldv.getUint16(26, true);
-    const lExtraLen = ldv.getUint16(28, true);
-    const dataOff = entry.localOffset + 30 + lNameLen + lExtraLen;
-
-    const t0 = performance.now();
-    const chunks = [];
-    let got = 0;
-
-    if (entry.method === 0) {
-      // stored: fetch in sequential chunks and assemble
-      let pos = 0;
-      while (pos < entry.compSize) {
-        const n = Math.min(CHUNK, entry.compSize - pos);
-        const c = await getBytes(dataOff + pos, n, signal.signal);
-        chunks.push(c);
-        pos += c.byteLength;
-        got = pos;
-        const frac = got / entry.compSize;
-        const speed = got / ((performance.now() - t0) / 1000);
-        setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
-      }
-    } else if (entry.method === 8) {
-      // deflate: fetch compressed chunks, stream-inflate while downloading
-      const ds = new DecompressionStream("deflate-raw");
-      const writer = ds.writable.getWriter();
-      const reader = ds.readable.getReader();
-      const readAll = (async () => {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-        }
-      })();
-      let pos = 0;
-      while (pos < entry.compSize) {
-        const n = Math.min(CHUNK, entry.compSize - pos);
-        const c = await getBytes(dataOff + pos, n, signal.signal);
-        await writer.write(c);
-        pos += c.byteLength;
-        const frac = pos / entry.compSize;
-        setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
-      }
-      await writer.close();
-      await readAll;
-      if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
+    const dataOff = await resolveDataOff(entry, signal.signal);
+    const canStream = swReady && (entry.method === 0 || (entry.method === 8 && typeof DecompressionStream !== "undefined"));
+    if (canStream) {
+      startStream(entry, dataOff);
     } else {
-      throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
+      await playEntryBlob(entry, dataOff, signal);
     }
-
-    const came = chunks.reduce((s, c) => s + c.byteLength, 0);
-    const blob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
-    lastObjectURL = URL.createObjectURL(blob);
-    player.src = lastObjectURL;
-    player.play().catch(() => {});
-    const secs = (performance.now() - t0) / 1000;
-    setProgress(false);
-    setStatus(
-      `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
-      (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
-      ` — the ZIP stayed on the server.`,
-      "ok"
-    );
   } catch (e) {
     setProgress(false);
     if (e.name === "AbortError") setStatus("Cancelled.", "warn");
@@ -389,6 +373,90 @@ async function playEntry(entry) {
     loadBtn.disabled = false;
     currentAbort = null;
   }
+}
+
+/** True streaming: hand the Service Worker virtual URL to <video>. */
+function startStream(entry, dataOff) {
+  streamActive = true;
+  fetchMeta.textContent = entry.method === 0
+    ? "Streaming (stored entry) — instant start, seek anywhere; only watched bytes are fetched"
+    : "Streaming (deflated entry) — inflating in a Service Worker; seek within already-loaded data";
+  setProgress(false);
+  const url = virtualUrl(entry, dataOff);
+  player.onerror = () => {
+    if (!streamActive) return;
+    streamActive = false;
+    player.onerror = null;
+    player.src = "";
+    setStatus("Streaming failed — retrying with full-entry download…", "warn");
+    playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+  };
+  player.src = url;
+  player.play().catch(() => {});
+  setStatus(`▶ Streaming "${entry.name}" — the browser fetches only the byte ranges it needs; the ZIP stays on the server.`, "ok");
+}
+
+/** Fallback: download the whole entry, inflate if needed, play from a Blob. */
+async function playEntryBlob(entry, dataOff, signal) {
+  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
+  const t0 = performance.now();
+  const chunks = [];
+  let got = 0;
+
+  if (entry.method === 0) {
+    // stored: fetch in sequential chunks and assemble
+    let pos = 0;
+    while (pos < entry.compSize) {
+      const n = Math.min(CHUNK, entry.compSize - pos);
+      const c = await getBytes(dataOff + pos, n, signal.signal);
+      chunks.push(c);
+      pos += c.byteLength;
+      got = pos;
+      const frac = got / entry.compSize;
+      const speed = got / ((performance.now() - t0) / 1000);
+      setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
+    }
+  } else if (entry.method === 8) {
+    // deflate: fetch compressed chunks, stream-inflate while downloading
+    const ds = new DecompressionStream("deflate-raw");
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    const readAll = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    })();
+    let pos = 0;
+    while (pos < entry.compSize) {
+      const n = Math.min(CHUNK, entry.compSize - pos);
+      const c = await getBytes(dataOff + pos, n, signal.signal);
+      await writer.write(c);
+      pos += c.byteLength;
+      const frac = pos / entry.compSize;
+      setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
+    }
+    await writer.close();
+    await readAll;
+    if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
+  } else {
+    throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
+  }
+
+  const came = chunks.reduce((s, c) => s + c.byteLength, 0);
+  const blob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
+  lastObjectURL = URL.createObjectURL(blob);
+  player.src = lastObjectURL;
+  player.play().catch(() => {});
+  const secs = (performance.now() - t0) / 1000;
+  setProgress(false);
+  setStatus(
+    `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
+    (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
+    ` — the ZIP stayed on the server.`,
+    "ok"
+  );
 }
 
 /* ============================================================
@@ -447,12 +515,113 @@ function decodeEntities(s) {
   return s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
+/** Bucket a list of media URLs into { videos, photos, zips } by extension. */
+function classifyMedia(urls) {
+  const videos = [], photos = [], zips = [];
+  const seen = new Set();
+  for (const raw of urls || []) {
+    if (!raw) continue;
+    const u = String(raw).trim();
+    if (seen.has(u)) continue;
+    seen.add(u);
+    const clean = u.split(/[?#]/)[0].toLowerCase();
+    const ext = (clean.split(".").pop() || "").replace(/[^\w]/g, "");
+    if (ext === "zip" || ext === "rar" || ext === "7z") zips.push(u);
+    else if (/^(mp4|m4v|mov|webm|mkv|avi|flv|ts|m2ts|3gp)$/.test(ext)) videos.push(u);
+    else if (/^(jpe?g|png|gif|webp|avif|bmp|svg)$/.test(ext)) photos.push(u);
+    else if (clean.includes("telesco.pe")) photos.push(u); // Telegram CDN media (extension-less preview images)
+  }
+  return { videos, photos, zips };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+const BACKEND = "http://127.0.0.1:8788";
+
+/** Try the local MTProto backend first (it can stream real video attachments). */
+async function tryBackendResolve(tgUrl) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch(BACKEND + "/api/resolve?url=" + encodeURIComponent(tgUrl), { signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const data = await r.json();
+      return data && data.ok ? { status: "ok", data } : { status: "off" };
+    }
+    // 500 with a "login" message → backend running but not logged in
+    const data = await r.json().catch(() => null);
+    if (data && /login/i.test(data.error || "")) return { status: "needLogin" };
+    return { status: "off" };
+  } catch (e) { return { status: "off" }; }
+}
+
+function renderBackendResult(info, meta) {
+  const dur = meta.duration ? Math.round(meta.duration) + "s · " : "";
+  tgBody.innerHTML =
+    `<p class="note">Channel: <b>@${escapeHtml(info.channel)}</b>${info.post ? " · post #" + info.post : ""}</p>` +
+    `<p class="note">🎬 ${escapeHtml(meta.title)}<br><span class="meta">${dur}${fmtBytes(meta.size)} · ${escapeHtml(meta.mime)}</span></p>` +
+    `<div class="row"><button class="ghost" id="backendPlay">▶ Stream video (via local backend)</button></div>` +
+    `<p class="note tip">Streaming over MTProto with seeking — only the parts you watch are fetched.</p>`;
+  $("backendPlay").addEventListener("click", () => playStreamUrl(BACKEND + meta.stream, meta));
+}
+
+function playStreamUrl(url, meta) {
+  playerCard.hidden = false;
+  playerCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  playerTitle.textContent = meta.title || "Telegram video";
+  fetchMeta.textContent = "Streaming from Telegram via local backend — seekable";
+  revokeLast();
+  player.src = "";
+  player.onerror = null;
+  player.src = url;
+  player.play().catch(() => {});
+  filesCard.hidden = true;
+  tgCard.hidden = true;
+  setStatus(`▶ Streaming "${meta.title || "Telegram video"}" — the backend serves only the byte ranges requested.`, "ok");
+}
+
 async function handleTelegram(text) {
   const info = parseTelegramLink(text);
   tgCard.hidden = false;
   tgBody.innerHTML = "<p class='note'>Resolving Telegram post…</p>";
   const target = `https://t.me/${info.channel}${info.post ? "/" + info.post : ""}`;
   const embedUrl = target + "?embed=1&mode=tme";
+
+  // path 0: local MTProto backend — can stream actual video attachments (not just photos)
+  const backend = await tryBackendResolve(target);
+  if (backend.status === "ok" && backend.data.kind === "video") {
+    renderBackendResult(info, backend.data);
+    return;
+  }
+  if (backend.status === "ok" && backend.data.kind === "file") {
+    const isZip = /\.zip$/i.test(backend.data.title) || /zip/i.test(backend.data.mime || "");
+    if (isZip) {
+      tgBody.innerHTML =
+        `<p class="note">📦 This post is a <b>ZIP archive</b>:</p>` +
+        `<p class="note">${escapeHtml(backend.data.title)}<br><span class="meta">${fmtBytes(backend.data.size)}</span></p>` +
+        `<div class="row"><button class="ghost" id="openZipBtn">📂 Open archive — list videos inside</button></div>` +
+        `<p class="note tip">ZipStream reads the archive index over Range requests and streams one video at a time — no full download.</p>`;
+      $("openZipBtn").addEventListener("click", () => {
+        urlInput.value = BACKEND + "/api/stream?url=" + encodeURIComponent(target);
+        load();
+      });
+    } else {
+      tgBody.innerHTML =
+        `<p class="note">📦 This post is a <b>file</b>, not a playable video:</p>` +
+        `<p class="note">${escapeHtml(backend.data.title)}<br><span class="meta">${fmtBytes(backend.data.size)} · ${escapeHtml(backend.data.mime)}</span></p>` +
+        `<p class="status warn">ZipStream plays <b>videos</b> (or videos inside a .zip). Paste a link to a post that actually contains a video.</p>`;
+    }
+    return;
+  }
+  if (backend.status === "needLogin") {
+    tgBody.innerHTML =
+      `<p class="status warn">Local backend found, but it isn't logged in yet.</p>` +
+      `<p class="note">Run <code>npm run login</code> in the <code>backend/</code> folder (needs an api_id/api_hash from my.telegram.org), then try this link again.</p>`;
+    return;
+  }
 
   // path 1: jina reader first — CORS-reflecting, usually resolves in <1s, no proxy-outage dependency
   let media = null, channel = null, title = null, reachedTelegram = false;
@@ -627,6 +796,40 @@ function fmtBytes(n) {
   return n.toFixed(n < 10 ? 2 : 1) + " " + u[i];
 }
 
+/* ============================================================
+   Service Worker — enables true seekable streaming via <video>
+   ============================================================ */
+const swStateEl = $("swState");
+function setSwState(state) {
+  if (!swStateEl) return;
+  swStateEl.className = "hint" + (state === "on" ? " ok" : state === "off" ? " warn" : "");
+  swStateEl.textContent = state === "on"
+    ? "Streaming engine: active — videos stream with seeking (only watched bytes are fetched)."
+    : state === "pending"
+      ? "Streaming engine: starting… open a video again in a moment."
+      : state === "off"
+        ? "Streaming engine: unavailable — will download one full entry instead."
+        : "";
+}
+
+async function initSW() {
+  if (!("serviceWorker" in navigator)) { setSwState("off"); return; }
+  const onControl = () => {
+    swReady = !!navigator.serviceWorker.controller;
+    setSwState(swReady ? "on" : "pending");
+  };
+  navigator.serviceWorker.addEventListener("controllerchange", onControl);
+  try {
+    await navigator.serviceWorker.register("sw.js", { scope: "./" });
+  } catch (e) { setSwState("off"); return; }
+  onControl();
+  if (!swReady) {
+    // First visit: the worker installs/activates and calls clients.claim();
+    // controllerchange flips swReady as soon as it takes control.
+    setTimeout(onControl, 1500);
+  }
+}
+
 /* ---------------- wiring ---------------- */
 loadBtn.addEventListener("click", load);
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
@@ -634,3 +837,5 @@ cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort
 $("demoBtn1").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo.zip"; load(); });
 $("demoBtn2").addEventListener("click", () => { urlInput.value = "https://raw.githubusercontent.com/Sai2-max/zipstream/2f7ec89f9cd50ac7860706a1375546a428d92287/demo2.zip"; load(); });
 $("demoTgBtn").addEventListener("click", () => { urlInput.value = "https://t.me/ultimateeditors02/13"; load(); });
+
+initSW();
