@@ -408,8 +408,14 @@ function startStream(entry, dataOff) {
     player.src = "";
     // Only try transcode for direct video URLs (not ZIP entries)
     if (conn.url.startsWith(BACKEND + "/api/stream")) {
-      setStatus("Transcode not available for ZIP entries — retrying with full-entry download…", "warn");
-      playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+      if (entry.method === 0) {
+        // Stored entry: the server can stream exactly these bytes, so give an
+        // instant download link instead of buffering the whole entry in RAM.
+        offerEntryDownload(entry, dataOff);
+      } else {
+        setStatus("Streaming failed — downloading the entry so you can play it locally…", "warn");
+        playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+      }
     } else {
       setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
       playViaTranscode(entry, dataOff).catch(() => {
@@ -441,6 +447,33 @@ async function playViaTranscode(entry, dataOff) {
   player.src = transcodeUrl;
   await player.play().catch(() => {});
   setStatus(`▶ Transcoding "${entry.name}" — server converts HEVC→H.264 for browser playback.`, "ok");
+}
+
+/** Instant download link for a stored ZIP entry, streamed by the backend. */
+function offerEntryDownload(entry, dataOff) {
+  let target = conn.url;
+  try { target = new URL(conn.url).searchParams.get("url") || conn.url; } catch { /* keep */ }
+  const fileName = entry.name.split("/").pop() || entry.name;
+  const href = BACKEND + "/api/entry" +
+    "?url=" + encodeURIComponent(target) +
+    "&off=" + dataOff +
+    "&len=" + entry.compSize +
+    "&name=" + encodeURIComponent(fileName) +
+    "&type=" + encodeURIComponent(extType(entry.name) || "application/octet-stream");
+
+  fetchMeta.textContent = "This browser can't decode this video (usually HEVC/H.265). Download it and open it in VLC:";
+  const old = fetchMeta.querySelector(".dl-btn");
+  if (old) old.remove();
+  const a = document.createElement("a");
+  a.className = "playbtn dl-btn";
+  a.href = href;
+  a.download = fileName;
+  a.textContent = "⬇ Download " + fileName;
+  a.style.marginLeft = "8px";
+  fetchMeta.appendChild(document.createTextNode(" "));
+  fetchMeta.appendChild(a);
+  setProgress(false);
+  setStatus("⚠ This codec isn't supported by the browser. Click Download — the server streams the entry from Telegram and the ZIP stays remote.", "warn");
 }
 
 /** Fallback: download the whole entry, inflate if needed, play from a Blob. */

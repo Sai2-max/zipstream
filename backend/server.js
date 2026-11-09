@@ -175,20 +175,66 @@ async function handleStream(req, res, url) {
     ...CORS,
   };
   if (range) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+  return pumpMedia(req, res, meta, start, length, headers, range ? 206 : 200);
+}
 
+/** Download one stored ZIP entry directly from Telegram — no client buffering. */
+async function handleEntry(req, res, url) {
+  const target = url.searchParams.get("url");
+  const off = Number(url.searchParams.get("off"));
+  const len = Number(url.searchParams.get("len"));
+  const name = url.searchParams.get("name") || "video.mp4";
+  const type = url.searchParams.get("type") || "application/octet-stream";
+  if (!target || !Number.isFinite(off) || !Number.isFinite(len) || off < 0 || len <= 0) {
+    return sendJson(res, 400, { ok: false, error: "Need ?url=&off=&len=" });
+  }
+
+  let meta;
+  try {
+    meta = await getMedia(target);
+  } catch (e) {
+    return sendJson(res, 500, { ok: false, error: e.message });
+  }
+  if (off + len > meta.size) {
+    return sendJson(res, 400, { ok: false, error: "Entry range is outside the file." });
+  }
+
+  const range = parseRange(req.headers.range, len);
+  if (range && range.unsatisfiable) {
+    res.writeHead(416, { "Content-Range": `bytes */${len}`, ...CORS });
+    return res.end();
+  }
+  const start = off + (range ? range.start : 0);
+  const length = range ? range.end - range.start + 1 : len;
+  const safeName = (name.split(/[\\/]/).pop() || "video.mp4");
+  const asciiName = safeName.replace(/[^\x20-\x7E]/g, "_").replace(/"/g, "'");
+  const headers = {
+    "Content-Type": type,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    "Content-Length": String(length),
+    "Content-Disposition": `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`,
+    "Connection": "close",
+    ...CORS,
+  };
+  if (range) headers["Content-Range"] = `bytes ${range.start}-${range.end}/${len}`;
+  return pumpMedia(req, res, meta, start, length, headers, range ? 206 : 200);
+}
+
+/** Stream `length` bytes of `meta` starting at absolute offset `start`. */
+async function pumpMedia(req, res, meta, start, length, headers, status) {
   if (req.method === "HEAD") {
-    res.writeHead(range ? 206 : 200, headers);
+    res.writeHead(status, headers);
     return res.end();
   }
 
   // Prefetch the first chunk before sending headers, so a Telegram outage
   // becomes a readable JSON error instead of a dead socket ("Failed to fetch").
-  console.log(`[stream] ${start}+${length} (range=${!!range})`);
+  console.log(`[stream] ${start}+${length}`);
   let first;
   try {
     first = await fetchRange(meta, start, Math.min(CHUNK, length));
     if (!first || first.length === 0) throw new Error("Telegram returned no data");
-    console.log(`[stream] preflight ${first.length}/${Math.min(CHUNK, length)}`);
   } catch (e) {
     console.error("stream preflight error:", e.message);
     return sendJson(res, 502, {
@@ -197,7 +243,7 @@ async function handleStream(req, res, url) {
     });
   }
 
-  res.writeHead(range ? 206 : 200, headers);
+  res.writeHead(status, headers);
 
   const writeChunk = (buf) => new Promise((resolve, reject) => {
     const onDrain = () => { cleanup(); resolve(); };
@@ -218,7 +264,6 @@ async function handleStream(req, res, url) {
       await writeChunk(buf.length > n ? buf.subarray(0, n) : buf);
       sent += Math.min(buf.length, n);
     }
-    console.log(`[stream] done ${sent}/${length}`);
     res.end();
   } catch (e) {
     console.error("stream error:", e.message);
@@ -400,6 +445,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (u.pathname === "/api/resolve") return handleResolve(req, res, u);
   if (u.pathname === "/api/stream") return handleStream(req, res, u);
+  if (u.pathname === "/api/entry") return handleEntry(req, res, u);
   if (u.pathname === "/api/transcode") return handleTranscode(req, res, u);
   if (req.method === "GET" || req.method === "HEAD") return serveStatic(req, res, u.pathname);
   sendJson(res, 404, { ok: false, error: "not found" });
