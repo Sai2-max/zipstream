@@ -22,10 +22,12 @@ const progressText = $("progressText"), cancelBtn = $("cancelBtn");
 const zipNameEl = $("zipName"), zipMetaEl = $("zipMeta"), fileListEl = $("fileList");
 const filesCard = $("filesCard"), tgCard = $("tgCard"), tgBody = $("tgBody");
 const playerCard = $("playerCard"), player = $("player"), playerTitle = $("playerTitle"), fetchMeta = $("fetchMeta");
+const pwRow = $("pwRow"), zipPasswordEl = $("zipPassword"), pwBtn = $("pwBtn");
 
 let currentAbort = null;
 let swReady = false;      // Service Worker controlling this page → seekable streaming on
 let streamActive = false; // current playback is SW streaming (used for error fallback)
+let zipPassword = "";     // password for ZipCrypto-encrypted archives
 
 /* ---------------- logging / status ---------------- */
 function setStatus(text, kind) {
@@ -263,6 +265,8 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
     if (dv.getUint32(p, true) !== CEN_SIG) break;
     const flags = dv.getUint16(p + 8, true);
     const method = dv.getUint16(p + 10, true);
+    const dosTime = dv.getUint16(p + 12, true);
+    const crc = dv.getUint32(p + 16, true);
     const compSizeR = dv.getUint32(p + 20, true);
     const uncompSizeR = dv.getUint32(p + 24, true);
     const nameLen = dv.getUint16(p + 28, true);
@@ -293,7 +297,7 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
       ? decodeName(td, cd.subarray(p + 46 + nameLen + extraLen, p + 46 + nameLen + extraLen + commentLen), flags)
       : "";
 
-    this.entries.push({ name, method, flags, compSize, uncompSize, localOffset: lo, comment });
+    this.entries.push({ name, method, flags, compSize, uncompSize, localOffset: lo, comment, crc, dosTime });
     p += 46 + nameLen + extraLen + commentLen;
   }
   if (!this.entries.length) throw new Error("ZIP index parsed but it has 0 entries (encrypted or non-standard ZIP?).");
@@ -336,6 +340,95 @@ function extType(name) {
 }
 function isPlayable(name) { const t = extType(name); return !!t && /^video|audio/.test(t); }
 
+/* ============================================================
+   ZipCrypto (traditional PKWARE) — for password-protected ZIPs
+   ============================================================ */
+const ZIP_CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+const zipCrcByte = (crc, b) => ((crc >>> 8) ^ ZIP_CRC_TABLE[(crc ^ b) & 0xff]) >>> 0;
+
+class ZipCrypto {
+  constructor(password) {
+    this.k0 = 0x12345678; this.k1 = 0x23456789; this.k2 = 0x34567890;
+    for (let i = 0; i < password.length; i++) this.update(password.charCodeAt(i) & 0xff);
+  }
+  update(b) {
+    this.k0 = zipCrcByte(this.k0, b);
+    this.k1 = (Math.imul((this.k1 + (this.k0 & 0xff)) >>> 0, 134775813) + 1) >>> 0;
+    this.k2 = zipCrcByte(this.k2, (this.k1 >>> 24) & 0xff);
+  }
+  decryptByte() {
+    const t = (this.k2 | 2) & 0xffff;
+    return (Math.imul(t, t ^ 1) >>> 8) & 0xff;
+  }
+  decrypt(bytes) {
+    const out = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) {
+      const p = bytes[i] ^ this.decryptByte();
+      this.update(p);
+      out[i] = p;
+    }
+    return out;
+  }
+}
+
+const isEncrypted = (entry) => (entry.flags & 1) !== 0;
+
+/** Read an entry's stored bytes, decrypting ZipCrypto as it goes. */
+async function readCompressedEntry(entry, dataOff, signal, onProgress) {
+  if (!isEncrypted(entry)) {
+    const parts = [];
+    let pos = 0;
+    while (pos < entry.compSize) {
+      const n = Math.min(CHUNK, entry.compSize - pos);
+      const c = await getBytes(dataOff + pos, n, signal);
+      parts.push(c);
+      pos += c.byteLength;
+      onProgress && onProgress(pos);
+    }
+    return parts;
+  }
+
+  if (!zipPassword) throw new Error("This archive is password-protected. Enter the ZIP password above.");
+
+  const cipher = new ZipCrypto(zipPassword);
+  const parts = [];
+  const header = new Uint8Array(12);
+  let headerGot = 0, checked = false, pos = 0;
+
+  while (pos < entry.compSize) {
+    const n = Math.min(CHUNK, entry.compSize - pos);
+    let c = await getBytes(dataOff + pos, n, signal);
+    pos += c.byteLength;
+
+    if (!checked) {
+      const take = Math.min(12 - headerGot, c.length);
+      header.set(c.subarray(0, take), headerGot);
+      headerGot += take;
+      c = c.subarray(take);
+      if (headerGot < 12) continue;
+      cipher.decrypt(header); // advance the key state past the header
+      checked = true;
+      // Check byte: high byte of DOS time when a data descriptor follows,
+      // otherwise the high byte of the CRC-32.
+      const expected = (entry.flags & 0x8)
+        ? (entry.dosTime >>> 8) & 0xff
+        : (entry.crc >>> 24) & 0xff;
+      if (header[11] !== expected) throw new Error("Wrong ZIP password — check it and try again.");
+    }
+    if (c.length) parts.push(cipher.decrypt(c));
+    onProgress && onProgress(pos);
+  }
+  return parts;
+}
+
 let lastObjectURL = null;
 function revokeLast() { if (lastObjectURL) { URL.revokeObjectURL(lastObjectURL); lastObjectURL = null; } }
 
@@ -376,6 +469,19 @@ async function playEntry(entry) {
 
   try {
     const dataOff = await resolveDataOff(entry, signal.signal);
+
+    // Encrypted entries can't be range-streamed: ZipCrypto is sequential, so
+    // download + decrypt the entry instead of handing a virtual URL to <video>.
+    if (isEncrypted(entry)) {
+      if (!zipPassword) {
+        pwRow.hidden = false;
+        zipPasswordEl.focus();
+        throw new Error("🔒 This archive is password-protected. Type the ZIP password above, click Unlock, then press Play again.");
+      }
+      await playEntryBlob(entry, dataOff, signal);
+      return;
+    }
+
     const canStream = swReady && (entry.method === 0 || (entry.method === 8 && typeof DecompressionStream !== "undefined"));
     if (canStream) {
       startStream(entry, dataOff);
@@ -476,50 +582,43 @@ function offerEntryDownload(entry, dataOff) {
   setStatus("⚠ This codec isn't supported by the browser. Click Download — the server streams the entry from Telegram and the ZIP stays remote.", "warn");
 }
 
-/** Fallback: download the whole entry, inflate if needed, play from a Blob. */
+/** Fallback: download the whole entry, decrypt/inflate if needed, play from a Blob. */
 async function playEntryBlob(entry, dataOff, signal) {
-  fetchMeta.textContent = entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
+  const encrypted = isEncrypted(entry);
+  fetchMeta.textContent = encrypted
+    ? "Encrypted entry — downloading and decrypting in your browser"
+    : entry.method === 0 ? "Stored (uncompressed) entry" : "Deflated entry — inflating in your browser";
   const t0 = performance.now();
-  const chunks = [];
-  let got = 0;
+  let chunks;
+
+  setProgress(true, 0, encrypted ? "downloading + decrypting…" : "downloading entry…");
+  const comp = await readCompressedEntry(entry, dataOff, signal.signal, (pos) => {
+    const speed = pos / ((performance.now() - t0) / 1000);
+    const frac = pos / entry.compSize;
+    setProgress(true, frac * 100,
+      `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)}${encrypted ? " · decrypting" : ""} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
+  });
 
   if (entry.method === 0) {
-    // stored: fetch in sequential chunks and assemble
-    let pos = 0;
-    while (pos < entry.compSize) {
-      const n = Math.min(CHUNK, entry.compSize - pos);
-      const c = await getBytes(dataOff + pos, n, signal.signal);
-      chunks.push(c);
-      pos += c.byteLength;
-      got = pos;
-      const frac = got / entry.compSize;
-      const speed = got / ((performance.now() - t0) / 1000);
-      setProgress(true, frac * 100, `${fmtBytes(got)} / ${fmtBytes(entry.compSize)} · ${fmtBytes(speed)}/s · only this entry, not the whole ZIP`);
-    }
+    // stored: the (decrypted) bytes are the file itself
+    chunks = comp;
   } else if (entry.method === 8) {
-    // deflate: fetch compressed chunks, stream-inflate while downloading
     const ds = new DecompressionStream("deflate-raw");
     const writer = ds.writable.getWriter();
     const reader = ds.readable.getReader();
+    const inflated = [];
     const readAll = (async () => {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        chunks.push(value);
+        inflated.push(value);
       }
     })();
-    let pos = 0;
-    while (pos < entry.compSize) {
-      const n = Math.min(CHUNK, entry.compSize - pos);
-      const c = await getBytes(dataOff + pos, n, signal.signal);
-      await writer.write(c);
-      pos += c.byteLength;
-      const frac = pos / entry.compSize;
-      setProgress(true, frac * 100, `${fmtBytes(pos)} / ${fmtBytes(entry.compSize)} compressed · inflating…`);
-    }
+    for (const c of comp) await writer.write(c);
     await writer.close();
     await readAll;
-    if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be encrypted.");
+    chunks = inflated;
+    if (chunks.length === 0 || entry.uncompSize === 0) throw new Error("Nothing inflated — ZIP may be corrupted or use unsupported encryption.");
   } else {
     throw new Error("Unsupported ZIP compression method (" + entry.method + "). Only Stored (0) and Deflate (8) work in browsers.");
   }
@@ -533,33 +632,31 @@ async function playEntryBlob(entry, dataOff, signal) {
   setProgress(false);
   setStatus(
     `✅ Played "${entry.name}" after fetching ${fmtBytes(entry.compSize)} in ${secs.toFixed(1)}s` +
+    (encrypted ? " (decrypted)" : "") +
     (entry.method !== 0 ? ` (${fmtBytes(came)} after inflate)` : "") +
     ` — the ZIP stayed on the server.`,
     "ok"
   );
 
-  // Add download button for fallback (useful for HEVC/codec issues)
+  // Download button — saves the decrypted file (needed for unsupported codecs)
+  const fileName = entry.name.split("/").pop() || entry.name;
   const dlBtn = document.createElement("button");
   dlBtn.className = "playbtn dl-btn";
-  dlBtn.textContent = "⬇ Download entry";
+  dlBtn.textContent = "⬇ Download " + fileName;
   dlBtn.style.marginLeft = "8px";
   dlBtn.onclick = () => {
-    // Create fresh blob from chunks to ensure complete file
     const dlBlob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
     const dlUrl = URL.createObjectURL(dlBlob);
     const a = document.createElement("a");
     a.href = dlUrl;
-    a.download = entry.name;
+    a.download = fileName;
     a.click();
-    // Clean up after a moment
     setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
   };
-  // Insert in fetchMeta area
-  const metaEl = fetchMeta;
-  if (metaEl && !metaEl.querySelector(".dl-btn")) {
-    metaEl.appendChild(document.createTextNode(" "));
-    metaEl.appendChild(dlBtn);
-  }
+  const old = fetchMeta.querySelector(".dl-btn");
+  if (old) old.remove();
+  fetchMeta.appendChild(document.createTextNode(" "));
+  fetchMeta.appendChild(dlBtn);
 }
 
 /* ============================================================
@@ -830,6 +927,10 @@ async function load() {
 
   filesCard.hidden = true; tgCard.hidden = true; revokeLast(); player.src = "";
   loadBtn.disabled = true;
+  // A different archive → previous password no longer applies
+  zipPassword = "";
+  zipPasswordEl.value = "";
+  pwRow.hidden = true;
 
   try {
     if (parseTelegramLink(url)) {
@@ -861,8 +962,17 @@ async function load() {
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
+    const encryptedCount = entries.filter(isEncrypted).length;
+    pwRow.hidden = encryptedCount === 0;
     setProgress(false);
-    setStatus(`✅ Read the ZIP index: ${entries.length} files. Pick a video — only its bytes will be downloaded.`, "ok");
+    if (encryptedCount > 0) {
+      setStatus(
+        `✅ Read the ZIP index: ${entries.length} files. 🔒 ${encryptedCount} are password-protected — enter the ZIP password above, click Unlock, then Play.`,
+        "warn"
+      );
+    } else {
+      setStatus(`✅ Read the ZIP index: ${entries.length} files. Pick a video — only its bytes will be downloaded.`, "ok");
+    }
   } catch (e) {
     setProgress(false);
     setStatus("❌ " + e.message, "err");
@@ -887,6 +997,12 @@ function renderEntries(entries) {
     comp.className = "badge" + (e.method === 8 ? " deflate" : "");
     comp.textContent = e.method === 0 ? "stored" : e.method === 8 ? "deflated" : "method " + e.method;
     li.appendChild(comp);
+    if (isEncrypted(e)) {
+      const lock = document.createElement("span");
+      lock.className = "badge";
+      lock.textContent = "🔒 encrypted";
+      li.appendChild(lock);
+    }
     if (isPlayable(e.name)) {
       li.querySelector(".badge").classList.add("playable");
       const btn = document.createElement("button");
@@ -949,6 +1065,17 @@ async function initSW() {
 
 /* ---------------- wiring ---------------- */
 loadBtn.addEventListener("click", load);
+
+/* ---- ZIP password (ZipCrypto) ---- */
+pwBtn.addEventListener("click", () => {
+  const pw = zipPasswordEl.value.trim();
+  if (!pw) { setStatus("Type the archive password first.", "warn"); return; }
+  zipPassword = pw;
+  setStatus("🔓 Password saved. Press ▶ Play on a file to decrypt and play it.", "ok");
+});
+zipPasswordEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); pwBtn.click(); }
+});
 urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
 cancelBtn.addEventListener("click", () => { if (currentAbort) currentAbort.abort(); });
 const DEMO_COMMIT = "8006d7bf52b278d8b6342fa91a2ba219f5bd4c0a"; // current HEAD

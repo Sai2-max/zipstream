@@ -32,6 +32,7 @@ main { max-width: 880px; margin: 14px auto 40px; padding: 0 20px; display: grid;
 }
 h2 { margin: 0 0 10px; font-size: 17px; }
 .row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.row[hidden] { display: none !important; }
 .hint-row { justify-content: space-between; }
 .hint { color: var(--muted); font-size: 12.5px; }
 .hint.ok { color: var(--ok); }
