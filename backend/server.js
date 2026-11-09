@@ -10,7 +10,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { loadEnv, createClient, resolveMedia } from "./common.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, "..");   // repo root = frontend files
+const ROOT = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 8787);
 const CHUNK = 1024 * 1024;        // 1 MB per HTTP response chunk
 const REQUEST_SIZE = 512 * 1024;  // MTProto GetFile request size (Telegram's max)
@@ -26,6 +26,82 @@ const CORS = {
 const env = loadEnv();
 const client = env.TG_API_ID && env.TG_API_HASH ? createClient(env) : null;
 const mediaCache = new Map(); // t.me url -> { resolvedAt, meta }
+
+/* ===== ZipCrypto (traditional PKWARE) ===== */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+const crc32byte = (crc, b) => ((crc >>> 8) ^ CRC_TABLE[(crc ^ b) & 0xFF]) >>> 0;
+
+class ZipCrypto {
+  constructor(password) {
+    this.k0 = 0x12345678; this.k1 = 0x23456789; this.k2 = 0x34567890;
+    for (let i = 0; i < password.length; i++) this.update(password.charCodeAt(i) & 0xFF);
+  }
+  update(b) {
+    this.k0 = crc32byte(this.k0, b);
+    this.k1 = (Math.imul((this.k1 + (this.k0 & 0xFF)) >>> 0, 134775813) + 1) >>> 0;
+    this.k2 = crc32byte(this.k2, (this.k1 >>> 24) & 0xFF);
+  }
+  decryptByte() {
+    const t = (this.k2 | 2) & 0xFFFF;
+    return (Math.imul(t, t ^ 1) >>> 8) & 0xFF;
+  }
+  decrypt(bytes) {
+    const out = Buffer.alloc(bytes.length);
+    for (let i = 0; i < bytes.length; i++) {
+      const p = bytes[i] ^ this.decryptByte();
+      this.update(p);
+      out[i] = p;
+    }
+    return out;
+  }
+}
+
+/** Read and decrypt a ZIP entry stream from Telegram. */
+async function createEntryStream(meta, dataOff, compSize, password) {
+  const { PassThrough } = await import("node:stream");
+  const out = new PassThrough({ highWaterMark: 16 * 1024 * 1024 });
+
+  const encrypted = password && password.length > 0;
+  const cipher = encrypted ? new ZipCrypto(password) : null;
+  let headerBuf = Buffer.alloc(12);
+  let headerGot = 0, headerChecked = false, pos = 0;
+
+  try {
+    while (pos < compSize) {
+      const n = Math.min(CHUNK, compSize - pos);
+      const buf = await fetchRange(meta, dataOff + pos, n);
+      if (!buf || buf.length === 0) break;
+      pos += buf.length;
+
+      let chunk = buf;
+      if (encrypted) {
+        if (!headerChecked) {
+          const take = Math.min(12 - headerGot, chunk.length);
+          chunk.copy(headerBuf, headerGot, 0, take);
+          headerGot += take;
+          chunk = chunk.subarray(take);
+          if (headerGot < 12) continue;
+          cipher.decrypt(headerBuf); // advance key state
+          headerChecked = true;
+        }
+        if (chunk.length) chunk = cipher.decrypt(chunk);
+      }
+      out.write(chunk);
+    }
+    out.end();
+  } catch (e) {
+    out.destroy(e);
+  }
+  return out;
+}
 
 async function ensureConnected() {
   if (!client) {
@@ -271,10 +347,13 @@ async function pumpMedia(req, res, meta, start, length, headers, status) {
   }
 }
 
-/** Transcode endpoint: streams Telegram video through FFmpeg (HEVC → H.264) for browser playback. */
+/** Transcode endpoint: streams Telegram video (or ZIP entry) through FFmpeg (HEVC → H.264) for browser playback. */
 async function handleTranscode(req, res, url) {
   const target = url.searchParams.get("url");
-  const entryName = url.searchParams.get("entry"); // for ZIP entries
+  const entryName = url.searchParams.get("entry");
+  const dataOff = Number(url.searchParams.get("off"));
+  const compSize = Number(url.searchParams.get("len"));
+  const password = url.searchParams.get("pw") || "";
   if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
 
   let meta;
@@ -287,15 +366,13 @@ async function handleTranscode(req, res, url) {
     return sendJson(res, 400, { ok: false, error: "This post is a photo." });
   }
 
-  // For ZIP files, we'd need to extract the specific entry first
-  // This version transcodes the whole file (works for direct video posts)
-  if (meta.kind === "file" && !meta.isVideo) {
+  // ZIP entry: need off+len, otherwise transcode whole file (direct video)
+  const isZipEntry = Number.isFinite(dataOff) && Number.isFinite(compSize) && dataOff >= 0 && compSize > 0;
+  if (meta.kind === "file" && !meta.isVideo && !isZipEntry) {
     return sendJson(res, 400, { ok: false, error: "Not a video file. Use /api/stream for ZIP entries." });
   }
 
   const range = req.headers.range;
-  const totalSize = meta.size;
-
   // We don't know the output size in advance (transcoding changes it)
   // So we stream without Content-Length, using chunked transfer
   res.writeHead(200, {
@@ -324,8 +401,30 @@ async function handleTranscode(req, res, url) {
   let ffmpegProcess = null;
 
   try {
-    // Create input stream from Telegram
-    const inputStream = new PassThrough();
+    // Create input stream from Telegram (ZIP entry or whole file)
+    let inputStream;
+    if (isZipEntry) {
+      inputStream = await createEntryStream(meta, dataOff, compSize, password);
+    } else {
+      inputStream = new PassThrough({ highWaterMark: 16 * 1024 * 1024 });
+      const feedTelegram = async () => {
+        let sent = 0;
+        try {
+          while (sent < meta.size) {
+            const n = Math.min(CHUNK, meta.size - sent);
+            const buf = await fetchRange(meta, sent, n);
+            if (!buf || buf.length === 0) break;
+            inputStream.write(buf);
+            sent += buf.length;
+          }
+          inputStream.end();
+        } catch (e) {
+          console.error("[transcode] feed error:", e.message);
+          inputStream.destroy(e);
+        }
+      };
+      feedTelegram();
+    }
 
     // Start FFmpeg: input from Telegram stream, output H.264 MP4
     ffmpegProcess = ffmpeg(inputStream)
@@ -357,26 +456,6 @@ async function handleTranscode(req, res, url) {
         if (!res.writableEnded) outputStream.end();
       })
       .pipe(outputStream, { end: true });
-
-    // Feed Telegram data into FFmpeg input
-    const feedTelegram = async () => {
-      let sent = 0;
-      try {
-        while (sent < totalSize) {
-          const n = Math.min(CHUNK, totalSize - sent);
-          const buf = await fetchRange(meta, sent, n);
-          if (!buf || buf.length === 0) break;
-          inputStream.write(buf);
-          sent += buf.length;
-        }
-        inputStream.end();
-      } catch (e) {
-        console.error("[transcode] feed error:", e.message);
-        inputStream.destroy(e);
-      }
-    };
-
-    feedTelegram();
 
   } catch (e) {
     console.error("[transcode] setup error:", e.message);

@@ -512,23 +512,12 @@ function startStream(entry, dataOff) {
     streamActive = false;
     player.onerror = null;
     player.src = "";
-    // Only try transcode for direct video URLs (not ZIP entries)
-    if (conn.url.startsWith(BACKEND + "/api/stream")) {
-      if (entry.method === 0) {
-        // Stored entry: the server can stream exactly these bytes, so give an
-        // instant download link instead of buffering the whole entry in RAM.
-        offerEntryDownload(entry, dataOff);
-      } else {
-        setStatus("Streaming failed — downloading the entry so you can play it locally…", "warn");
-        playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
-      }
-    } else {
-      setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
-      playViaTranscode(entry, dataOff).catch(() => {
-        setStatus("Transcode failed — retrying with full-entry download…", "warn");
-        playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
-      });
-    }
+    // Always try transcode for codec errors (works for both direct and ZIP)
+    setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
+    playViaTranscode(entry, dataOff).catch(() => {
+      setStatus("Transcode failed — downloading entry for local playback…", "warn");
+      playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
+    });
   };
   
   player.onerror = handleError;
@@ -542,10 +531,14 @@ function startStream(entry, dataOff) {
   setStatus(`▶ Streaming "${entry.name}" — the browser fetches only the byte ranges it needs; the ZIP stays on the server.`, "ok");
 }
 
-/** Play via server-side transcode (HEVC → H.264 MP4) - only for direct video URLs */
+/** Play via server-side transcode (HEVC → H.264 MP4) — works for ZIP entries too. */
 async function playViaTranscode(entry, dataOff) {
   if (!entry.isVideo) return;
-  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(conn.url)}`;
+  // Extract the original t.me URL from conn.url
+  let target = conn.url;
+  try { target = new URL(conn.url).searchParams.get("url") || conn.url; } catch { /* keep */ }
+  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(target)}` +
+    `&off=${dataOff}&len=${entry.compSize}&pw=${encodeURIComponent(zipPassword)}`;
   fetchMeta.textContent = "Transcoding HEVC → H.264 (server-side)…";
   revokeLast();
   player.src = "";
@@ -553,33 +546,6 @@ async function playViaTranscode(entry, dataOff) {
   player.src = transcodeUrl;
   await player.play().catch(() => {});
   setStatus(`▶ Transcoding "${entry.name}" — server converts HEVC→H.264 for browser playback.`, "ok");
-}
-
-/** Instant download link for a stored ZIP entry, streamed by the backend. */
-function offerEntryDownload(entry, dataOff) {
-  let target = conn.url;
-  try { target = new URL(conn.url).searchParams.get("url") || conn.url; } catch { /* keep */ }
-  const fileName = entry.name.split("/").pop() || entry.name;
-  const href = BACKEND + "/api/entry" +
-    "?url=" + encodeURIComponent(target) +
-    "&off=" + dataOff +
-    "&len=" + entry.compSize +
-    "&name=" + encodeURIComponent(fileName) +
-    "&type=" + encodeURIComponent(extType(entry.name) || "application/octet-stream");
-
-  fetchMeta.textContent = "This browser can't decode this video (usually HEVC/H.265). Download it and open it in VLC:";
-  const old = fetchMeta.querySelector(".dl-btn");
-  if (old) old.remove();
-  const a = document.createElement("a");
-  a.className = "playbtn dl-btn";
-  a.href = href;
-  a.download = fileName;
-  a.textContent = "⬇ Download " + fileName;
-  a.style.marginLeft = "8px";
-  fetchMeta.appendChild(document.createTextNode(" "));
-  fetchMeta.appendChild(a);
-  setProgress(false);
-  setStatus("⚠ This codec isn't supported by the browser. Click Download — the server streams the entry from Telegram and the ZIP stays remote.", "warn");
 }
 
 /** Fallback: download the whole entry, decrypt/inflate if needed, play from a Blob. */
