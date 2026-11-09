@@ -2,10 +2,15 @@
    with HTTP Range support (seekable <video> playback). MTProto user session.
    Includes FFmpeg transcode for HEVC/H.265 → H.264 browser playback. */
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import bigInt from "big-integer";
 import ffmpeg from "fluent-ffmpeg";
 import { loadEnv, createClient, resolveMedia } from "./common.js";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");   // repo root = frontend files
 const PORT = Number(process.env.PORT || 8787);
 const CHUNK = 1024 * 1024;        // 1 MB per HTTP response chunk
 const REQUEST_SIZE = 512 * 1024;  // MTProto GetFile request size (Telegram's max)
@@ -286,6 +291,49 @@ async function handleTranscode(req, res, url) {
   }
 }
 
+/** Serve the frontend from the repo root so one process runs the whole app. */
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".wasm": "application/wasm",
+  ".zip": "application/zip",
+};
+
+function serveStatic(req, res, pathname) {
+  let rel;
+  try {
+    rel = pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
+  } catch {
+    return sendJson(res, 400, { ok: false, error: "Bad path" });
+  }
+  const file = path.resolve(ROOT, rel);
+  const ext = path.extname(file).toLowerCase();
+  // Only serve known static assets, never backend source, dotfiles or .env
+  if (!file.startsWith(ROOT + path.sep) || rel.split(/[\\/]/)[0] === "backend" ||
+      rel.startsWith(".") || !MIME[ext]) {
+    return sendJson(res, 404, { ok: false, error: "not found" });
+  }
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return sendJson(res, 404, { ok: false, error: "not found" });
+    res.writeHead(200, {
+      "Content-Type": MIME[ext],
+      "Content-Length": st.size,
+      "Cache-Control": "no-store",
+      ...(ext === ".js" ? { "Service-Worker-Allowed": "/" } : {}),
+    });
+    if (req.method === "HEAD") return res.end();
+    fs.createReadStream(file).pipe(res);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   if (req.method === "OPTIONS") {
@@ -305,12 +353,15 @@ const server = http.createServer(async (req, res) => {
   if (u.pathname === "/api/resolve") return handleResolve(req, res, u);
   if (u.pathname === "/api/stream") return handleStream(req, res, u);
   if (u.pathname === "/api/transcode") return handleTranscode(req, res, u);
+  if (req.method === "GET" || req.method === "HEAD") return serveStatic(req, res, u.pathname);
   sendJson(res, 404, { ok: false, error: "not found" });
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`ZipStream backend → http://127.0.0.1:${PORT}`);
+  console.log(`ZipStream app → http://localhost:${PORT}`);
+  console.log("  /             the web UI (index.html, app.js, style.css, sw.js)");
   console.log("  /health       status");
   console.log("  /api/resolve  ?url=https://t.me/channel/123");
   console.log("  /api/stream   ?url=https://t.me/channel/123  (supports Range)");
+  console.log("  /api/transcode ?url=https://t.me/channel/123 (HEVC → H.264)");
 });
