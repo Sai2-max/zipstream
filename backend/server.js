@@ -392,13 +392,13 @@ async function handleTranscode(req, res, url) {
   // Pipe FFmpeg output to HTTP response
   outputStream.pipe(res);
 
+  let ffmpegProcess = null;
+
   // Handle client disconnect
   req.on("close", () => {
-    ffmpegProcess?.kill("SIGKILL");
+    if (ffmpegProcess?.ffmpegProc) ffmpegProcess.ffmpegProc.kill("SIGKILL");
     outputStream.destroy();
   });
-
-  let ffmpegProcess = null;
 
   try {
     // Create input stream from Telegram (ZIP entry or whole file)
