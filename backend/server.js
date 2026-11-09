@@ -350,7 +350,6 @@ async function pumpMedia(req, res, meta, start, length, headers, status) {
 /** Transcode endpoint: streams Telegram video (or ZIP entry) through FFmpeg (HEVC → H.264) for browser playback. */
 async function handleTranscode(req, res, url) {
   const target = url.searchParams.get("url");
-  const entryName = url.searchParams.get("entry");
   const dataOff = Number(url.searchParams.get("off"));
   const compSize = Number(url.searchParams.get("len"));
   const password = url.searchParams.get("pw") || "";
@@ -373,6 +372,7 @@ async function handleTranscode(req, res, url) {
   }
 
   const range = req.headers.range;
+
   // We don't know the output size in advance (transcoding changes it)
   // So we stream without Content-Length, using chunked transfer
   res.writeHead(200, {
@@ -401,7 +401,19 @@ async function handleTranscode(req, res, url) {
   });
 
   try {
-    // Create input stream from Telegram (ZIP entry or whole file)
+    // For ZIP entries, we must buffer to a temp file first because
+    // the source MP4 often has moov at the end (non-fragmented).
+    // FFmpeg can't read that from a pipe. So: download → transcode → stream.
+    const { tmpdir } = await import("node:os");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+
+    const tmpDir = await mkdtemp(join(tmpdir(), "zipstream-transcode-"));
+    const inputPath = join(tmpDir, "input.mp4");
+    const { createWriteStream } = await import("node:fs");
+    const writeStream = createWriteStream(inputPath);
+
+    // Download the entry (decrypted) to temp file
     let inputStream;
     if (isZipEntry) {
       inputStream = await createEntryStream(meta, dataOff, compSize, password);
@@ -426,12 +438,20 @@ async function handleTranscode(req, res, url) {
       feedTelegram();
     }
 
-    // Start FFmpeg: input from Telegram stream, output H.264 MP4
-    ffmpegProcess = ffmpeg(inputStream)
+    await new Promise((resolve, reject) => {
+      inputStream.pipe(writeStream);
+      inputStream.on("end", resolve);
+      inputStream.on("error", reject);
+      writeStream.on("error", reject);
+    });
+
+    console.log("[transcode] buffered to temp file, starting FFmpeg");
+
+    // Start FFmpeg reading from temp file
+    ffmpegProcess = ffmpeg(inputPath)
       .inputOptions([
-        "-analyzeduration", "1000000",  // 1ms analyze
-        "-probesize", "500000",
-        "-fflags", "+genpts",
+        "-analyzeduration", "10000000",  // 10ms analyze
+        "-probesize", "5000000",
       ])
       .outputOptions([
         "-c:v", "libx264",
@@ -454,6 +474,8 @@ async function handleTranscode(req, res, url) {
       .on("end", () => {
         console.log("[transcode] FFmpeg finished");
         if (!res.writableEnded) outputStream.end();
+        // Cleanup temp file after done
+        rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       })
       .pipe(outputStream, { end: true });
 
