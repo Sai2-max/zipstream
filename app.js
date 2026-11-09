@@ -51,8 +51,19 @@ const PROXY_BUILDERS = {
   "isomorphic-git": (u) => "https://cors.isomorphic-git.org/" + u,
 };
 
-function modeList() {
+/** Public CORS proxies can never reach a backend on this machine. */
+function proxiesUsableFor(url) {
+  try {
+    const h = new URL(url, location.href).hostname;
+    return !(h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]");
+  } catch { return true; }
+}
+
+function modeList(url) {
+  const u = url || (conn && conn.url) || "";
   const mode = proxyMode.value;
+  // local backend (Telegram streaming) → direct only
+  if (!proxiesUsableFor(u)) return [null];
   if (mode === "direct") return [null];
   if (mode === "auto") return [null, "corsproxy.io", "allorigins", "cors.workers.dev", "isomorphic-git"];
   const list = [null, mode];
@@ -65,7 +76,7 @@ function modeList() {
  * header is often hidden by CORS and is never relied on.
  */
 async function probe(url, signal) {
-  const candidates = modeList();
+  const candidates = modeList(url);
   for (const key of candidates) {
     const target = key ? PROXY_BUILDERS[key](url) : url;
     try {
@@ -89,7 +100,7 @@ async function findSize(signal) {
   // Fast path: some hosts expose the total via Content-Range / Content-Length
   // (CORS-permitting). Saves ~2×log2(size) probes on large files.
   try {
-    const candidates = modeList();
+    const candidates = modeList(conn.url);
     for (const key of candidates) {
       const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
       const r = await fetch(target, { headers: { Range: "bytes=0-0" }, signal });
@@ -104,7 +115,7 @@ async function findSize(signal) {
   } catch (e) { /* fall back to binary search below */ }
 
   const probeByte = async (pos) => {
-    const candidates = modeList();
+    const candidates = modeList(conn.url);
     const order = conn && conn.key
       ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
       : candidates;
@@ -146,7 +157,7 @@ let conn = null; // { key, total, url }
 
 /** Fetch a byte range as Uint8Array using the chosen connection, with one fallback retry. */
 async function getBytes(start, length, signal) {
-  const candidates = modeList();
+  const candidates = modeList(conn.url);
   // try chosen first, then remaining candidates
   const order = conn && conn.key
     ? [conn.key, ...candidates.filter((k) => k !== conn.key)]
@@ -156,19 +167,23 @@ async function getBytes(start, length, signal) {
     const target = key ? PROXY_BUILDERS[key](conn.url) : conn.url;
     const need = length;
     if (need <= 0) return new Uint8Array(0);
-    try {
-      const r = await fetch(target, {
-        headers: { Range: `bytes=${start}-${start + need - 1}` },
-        signal,
-      });
-      if (r.status === 416) throw new Error("range past end of file");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (buf.byteLength === 0) throw new Error("empty response");
-      return buf;
-    } catch (e) {
-      if (e.name === "AbortError") throw e;
-      lastErr = e;
+    // Two attempts per candidate: long MTProto reads occasionally hiccup and
+    // a single failed request must not abort reading the ZIP index.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(target, {
+          headers: { Range: `bytes=${start}-${start + need - 1}` },
+          signal,
+        });
+        if (r.status === 416) throw new Error("range past end of file");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const buf = new Uint8Array(await r.arrayBuffer());
+        if (buf.byteLength === 0) throw new Error("empty response");
+        return buf;
+      } catch (e) {
+        if (e.name === "AbortError") throw e;
+        lastErr = e;
+      }
     }
   }
   throw new Error("Range fetch failed: " + (lastErr && lastErr.message));

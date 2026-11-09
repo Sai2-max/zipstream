@@ -38,13 +38,22 @@ const PROXY_BUILDERS = {
 };
 const CANDIDATES = [null, "corsproxy.io", "allorigins", "cors.workers.dev", "isomorphic-git"];
 
+/** Public CORS proxies can never reach a backend on this machine. */
+function isLocalUrl(u) {
+  try {
+    const h = new URL(u).hostname;
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  } catch { return false; }
+}
+
 function targetFor(key, url) { return key ? PROXY_BUILDERS[key](url) : url; }
 
 /* ---------------- remote fetch helpers ---------------- */
 
 /** Find a connection (direct or proxy) that answers HTTP Range requests. */
 async function probe(url) {
-  for (const key of CANDIDATES) {
+  const candidates = isLocalUrl(url) ? [null] : CANDIDATES;
+  for (const key of candidates) {
     const target = targetFor(key, url);
     try {
       const r = await fetch(target, { headers: { Range: "bytes=0-1" } });
@@ -59,22 +68,25 @@ async function probe(url) {
 /** Fetch a byte range as a Uint8Array, retrying across the fallback chain. */
 async function getBytes(conn, start, length) {
   if (length <= 0) return new Uint8Array(0);
+  const pool = isLocalUrl(conn.url) ? [null] : CANDIDATES;
   const order = conn.key !== null
-    ? [conn.key, ...CANDIDATES.filter((k) => k !== conn.key)]
-    : CANDIDATES;
+    ? [conn.key, ...pool.filter((k) => k !== conn.key)]
+    : pool;
   let lastErr = null;
   for (const key of order) {
     const target = targetFor(key, conn.url);
-    try {
-      const r = await fetch(target, {
-        headers: { Range: `bytes=${start}-${start + length - 1}` },
-      });
-      if (r.status === 416) throw new Error("range past end of file");
-      if (r.status !== 206) throw new Error("HTTP " + r.status + " (expected 206 Partial Content)");
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (buf.byteLength === 0) throw new Error("empty response");
-      return buf;
-    } catch (e) { lastErr = e; }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(target, {
+          headers: { Range: `bytes=${start}-${start + length - 1}` },
+        });
+        if (r.status === 416) throw new Error("range past end of file");
+        if (r.status !== 206) throw new Error("HTTP " + r.status + " (expected 206 Partial Content)");
+        const buf = new Uint8Array(await r.arrayBuffer());
+        if (buf.byteLength === 0) throw new Error("empty response");
+        return buf;
+      } catch (e) { lastErr = e; }
+    }
   }
   throw new Error("Range fetch failed: " + (lastErr && lastErr.message));
 }

@@ -68,17 +68,32 @@ function parseRange(header, size) {
 
 /** Fetch exactly `n` bytes of the media starting at `pos` (fewer at EOF). */
 async function fetchRange(meta, pos, n) {
-  const iter = client.iterDownload({
-    file: meta.media,          // MessageMediaDocument / MessageMediaPhoto
-    offset: bigInt(pos),
-    chunkSize: n,
-    stride: n,
-    limit: 1,
-    requestSize: REQUEST_SIZE,
-  });
-  const parts = [];
-  for await (const c of iter) parts.push(c);
-  return Buffer.concat(parts);
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (!client.connected) await client.connect();
+      const iter = client.iterDownload({
+        file: meta.media,          // MessageMediaDocument / MessageMediaPhoto
+        offset: bigInt(pos),
+        chunkSize: n,
+        stride: n,
+        limit: 1,
+        requestSize: REQUEST_SIZE,
+      });
+      const parts = [];
+      for await (const c of iter) parts.push(c);
+      const buf = Buffer.concat(parts);
+      // gramJS aligns reads to request boundaries and can return more than we
+      // asked for near EOF. Never exceed n or Content-Length will be wrong.
+      return buf.length > n ? buf.subarray(0, n) : buf;
+    } catch (e) {
+      lastErr = e;
+      console.error(`[fetchRange] ${e.message} — reconnect + retry ${attempt + 1}/3`);
+      try { await client.connect(); } catch { /* next attempt */ }
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 function sendJson(res, status, obj) {
@@ -153,24 +168,57 @@ async function handleStream(req, res, url) {
     "Accept-Ranges": "bytes",
     "Cache-Control": "no-store",
     "Content-Length": String(length),
+    // One response per TCP connection: Chrome reuses keep-alive sockets and
+    // occasionally hits ERR_EMPTY_RESPONSE when the server closes an idle one
+    // mid-read. Closing here makes every range request deterministic.
+    "Connection": "close",
     ...CORS,
   };
   if (range) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
 
+  if (req.method === "HEAD") {
+    res.writeHead(range ? 206 : 200, headers);
+    return res.end();
+  }
+
+  // Prefetch the first chunk before sending headers, so a Telegram outage
+  // becomes a readable JSON error instead of a dead socket ("Failed to fetch").
+  console.log(`[stream] ${start}+${length} (range=${!!range})`);
+  let first;
+  try {
+    first = await fetchRange(meta, start, Math.min(CHUNK, length));
+    if (!first || first.length === 0) throw new Error("Telegram returned no data");
+    console.log(`[stream] preflight ${first.length}/${Math.min(CHUNK, length)}`);
+  } catch (e) {
+    console.error("stream preflight error:", e.message);
+    return sendJson(res, 502, {
+      ok: false,
+      error: "Telegram connection problem — " + e.message + ". Retrying usually works.",
+    });
+  }
+
   res.writeHead(range ? 206 : 200, headers);
-  if (req.method === "HEAD") return res.end();
+
+  const writeChunk = (buf) => new Promise((resolve, reject) => {
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("client disconnected")); };
+    const cleanup = () => { res.off("drain", onDrain); res.off("close", onClose); };
+    if (res.write(buf)) { cleanup(); resolve(); }
+    else { res.once("drain", onDrain); res.once("close", onClose); }
+  });
 
   let sent = 0;
   try {
+    await writeChunk(first);
+    sent = first.length;
     while (sent < length) {
       const n = Math.min(CHUNK, length - sent);
       const buf = await fetchRange(meta, start + sent, n);
-      if (!buf || buf.length === 0) break;
-      if (!res.write(buf)) {
-        await new Promise((r) => res.once("drain", r));
-      }
-      sent += buf.length;
+      if (!buf || buf.length === 0) throw new Error(`Telegram returned no data at ${start + sent}`);
+      await writeChunk(buf.length > n ? buf.subarray(0, n) : buf);
+      sent += Math.min(buf.length, n);
     }
+    console.log(`[stream] done ${sent}/${length}`);
     res.end();
   } catch (e) {
     console.error("stream error:", e.message);
