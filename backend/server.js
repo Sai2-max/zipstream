@@ -8,7 +8,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import bigInt from "big-integer";
 import ffmpeg from "fluent-ffmpeg";
-import { loadEnv, createClient, resolveMedia } from "./common.js";
+import { loadEnv, createClient, resolveMedia, parseTgUrl } from "./common.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -133,6 +133,120 @@ async function getMedia(url) {
   return meta;
 }
 
+/**
+ * Build one virtual file by concatenating several Telegram documents.
+ * Split ZIPs (HiddenPie-style "course.z01" + "course.zip") only work when
+ * all volumes are read in order as a single byte stream.
+ */
+async function getVirtualMedia(targets) {
+  const parts = [];
+  let total = 0;
+  for (const target of targets) {
+    const meta = await getMedia(target);
+    if (meta.kind === "photo") throw new Error("A split-ZIP part is a photo, not a file.");
+    parts.push({ url: target, meta, start: total, size: meta.size });
+    total += meta.size;
+  }
+  return {
+    kind: "virtual",
+    title: parts.map((p) => p.meta.title).join(" + "),
+    mime: "application/zip",
+    size: total,
+    parts,
+  };
+}
+
+/** Unique `?url=` values, preserving their order. */
+function getTargets(url) {
+  return [...new Set(url.searchParams.getAll("url").filter(Boolean))];
+}
+
+function documentTitle(doc) {
+  let title = "";
+  for (const attr of doc.attributes || []) {
+    if (attr.className === "DocumentAttributeFilename" && attr.fileName) title = attr.fileName;
+  }
+  return title;
+}
+
+const SPLIT_NAME_RE = /^(.*)\.(zip|z\d{2})$/i;
+
+/**
+ * Find the sibling volumes of a split ZIP in the same Telegram channel.
+ * The volumes are posted next to each other, so scanning ±20 posts is enough.
+ */
+async function discoverParts(target) {
+  const { channel, post } = parseTgUrl(target);
+  const meta = await getMedia(target);
+  const fallback = { base: meta.title, parts: [{ url: target, title: meta.title, size: meta.size }], totalSize: meta.size, split: false };
+  if (meta.kind === "photo" || !post) return fallback;
+
+  const match = String(meta.title || "").match(SPLIT_NAME_RE);
+  if (!match) return fallback;
+  const base = match[1];
+  const baseLower = base.toLowerCase();
+
+  await ensureConnected();
+  const entity = await client.getEntity(channel);
+  const ids = [];
+  for (let i = Math.max(1, post - 20); i <= post + 20; i++) ids.push(i);
+  let messages = [];
+  try {
+    messages = await client.getMessages(entity, { ids });
+  } catch (e) {
+    console.warn("[parts] channel scan failed:", e.message);
+  }
+
+  const found = new Map(); // extension -> best candidate (closest post)
+  const consider = (msg) => {
+    const doc = msg && msg.media && msg.media.document;
+    if (!doc) return;
+    const title = documentTitle(doc);
+    const m = String(title).match(SPLIT_NAME_RE);
+    if (!m || m[1].toLowerCase() !== baseLower) return;
+    const ext = m[2].toLowerCase();
+    const size = doc.size && doc.size.toJSNumber ? doc.size.toJSNumber() : Number(doc.size);
+    const dist = Math.abs(msg.id - post);
+    const previous = found.get(ext);
+    if (!previous || dist < previous.dist) {
+      found.set(ext, {
+        url: `https://t.me/${channel}/${msg.id}`,
+        title,
+        size,
+        ext,
+        post: msg.id,
+        dist,
+      });
+    }
+  };
+  for (const msg of messages) consider(msg);
+  consider(meta.message);
+
+  if (!found.size) return fallback;
+  // A split archive is unusable without the final .zip volume (it holds the index).
+  if (![...found.keys()].some((ext) => ext === "zip")) return fallback;
+
+  const parts = [...found.values()]
+    .sort((a, b) => {
+      const av = a.ext === "zip" ? Infinity : parseInt(a.ext.slice(1), 10);
+      const bv = b.ext === "zip" ? Infinity : parseInt(b.ext.slice(1), 10);
+      return av - bv;
+    })
+    .map(({ dist, ...part }) => part);
+
+  // Warn when volume numbers have gaps (e.g. z01 + z03, missing z02).
+  const numbers = parts.filter((p) => p.ext !== "zip").map((p) => parseInt(p.ext.slice(1), 10)).sort((a, b) => a - b);
+  const missing = [];
+  if (numbers.length && numbers[0] !== 1) missing.push("z01");
+  for (let i = 1; i < numbers.length; i++) {
+    for (let n = numbers[i - 1] + 1; n < numbers[i]; n++) missing.push("z" + String(n).padStart(2, "0"));
+  }
+
+  const totalSize = parts.reduce((sum, p) => sum + p.size, 0);
+  return { base, parts, totalSize, split: parts.length > 1, missing };
+}
+
+
 function parseRange(header, size) {
   if (!header) return null;
   const m = header.match(/bytes=(\d*)-(\d*)/);
@@ -153,6 +267,7 @@ function parseRange(header, size) {
 
 /** Fetch exactly `n` bytes of the media starting at `pos` (fewer at EOF). */
 async function fetchRange(meta, pos, n) {
+  if (meta.parts) return fetchVirtualRange(meta, pos, n);
   let lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -179,6 +294,26 @@ async function fetchRange(meta, pos, n) {
     }
   }
   throw lastErr;
+}
+
+/** Read a byte range from a virtual concatenation of several Telegram files. */
+async function fetchVirtualRange(meta, start, n) {
+  const chunks = [];
+  let pos = start;
+  let left = n;
+  while (left > 0) {
+    const part = meta.parts.find((p) => pos >= p.start && pos < p.start + p.size);
+    if (!part) break;
+    const local = pos - part.start;
+    const take = Math.min(left, part.size - local);
+    const buf = await fetchRange(part.meta, local, take);
+    if (!buf || buf.length === 0) break;
+    const used = Math.min(buf.length, take);
+    chunks.push(buf.subarray(0, used));
+    pos += used;
+    left -= used;
+  }
+  return Buffer.concat(chunks);
 }
 
 function sendJson(res, status, obj) {
@@ -224,13 +359,24 @@ async function handleResolve(req, res, url) {
   }
 }
 
-async function handleStream(req, res, url) {
+async function handleParts(req, res, url) {
   const target = url.searchParams.get("url");
   if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
+  try {
+    const info = await discoverParts(target);
+    sendJson(res, 200, { ok: true, ...info });
+  } catch (e) {
+    sendJson(res, 500, { ok: false, error: e.message });
+  }
+}
+
+async function handleStream(req, res, url) {
+  const targets = getTargets(url);
+  if (!targets.length) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
 
   let meta;
   try {
-    meta = await getMedia(target);
+    meta = targets.length === 1 ? await getMedia(targets[0]) : await getVirtualMedia(targets);
   } catch (e) {
     return sendJson(res, 500, { ok: false, error: e.message });
   }
@@ -265,18 +411,18 @@ async function handleStream(req, res, url) {
 
 /** Download one stored ZIP entry directly from Telegram — no client buffering. */
 async function handleEntry(req, res, url) {
-  const target = url.searchParams.get("url");
+  const targets = getTargets(url);
   const off = Number(url.searchParams.get("off"));
   const len = Number(url.searchParams.get("len"));
   const name = url.searchParams.get("name") || "video.mp4";
   const type = url.searchParams.get("type") || "application/octet-stream";
-  if (!target || !Number.isFinite(off) || !Number.isFinite(len) || off < 0 || len <= 0) {
+  if (!targets.length || !Number.isFinite(off) || !Number.isFinite(len) || off < 0 || len <= 0) {
     return sendJson(res, 400, { ok: false, error: "Need ?url=&off=&len=" });
   }
 
   let meta;
   try {
-    meta = await getMedia(target);
+    meta = targets.length === 1 ? await getMedia(targets[0]) : await getVirtualMedia(targets);
   } catch (e) {
     return sendJson(res, 500, { ok: false, error: e.message });
   }
@@ -394,15 +540,16 @@ function serveCachedVideo(req, res, file) {
 /** Transcode endpoint: streams Telegram video (or ZIP entry) through FFmpeg (HEVC → H.264) for browser playback.
  *  The converted MP4 is cached on disk, so the first play converts and every replay is instant + seekable. */
 async function handleTranscode(req, res, url) {
-  const target = url.searchParams.get("url");
+  const targets = getTargets(url);
+  const target = targets.join("|");
   const dataOff = Number(url.searchParams.get("off"));
   const compSize = Number(url.searchParams.get("len"));
   const password = url.searchParams.get("pw") || "";
-  if (!target) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
+  if (!targets.length) return sendJson(res, 400, { ok: false, error: "Missing ?url=" });
 
   let meta;
   try {
-    meta = await getMedia(target);
+    meta = targets.length === 1 ? await getMedia(targets[0]) : await getVirtualMedia(targets);
   } catch (e) {
     return sendJson(res, 500, { ok: false, error: e.message });
   }
@@ -633,6 +780,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { ok: true, authorized, needLogin: !authorized });
   }
   if (u.pathname === "/api/resolve") return handleResolve(req, res, u);
+  if (u.pathname === "/api/parts") return handleParts(req, res, u);
   if (u.pathname === "/api/stream") return handleStream(req, res, u);
   if (u.pathname === "/api/entry") return handleEntry(req, res, u);
   if (u.pathname === "/api/transcode") return handleTranscode(req, res, u);
@@ -645,6 +793,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log("  /             the web UI (index.html, app.js, style.css, sw.js)");
   console.log("  /health       status");
   console.log("  /api/resolve  ?url=https://t.me/channel/123");
-  console.log("  /api/stream   ?url=https://t.me/channel/123  (supports Range)");
+  console.log("  /api/parts    ?url=https://t.me/channel/123  (finds .z01 + .zip volumes)");
+  console.log("  /api/stream   ?url=https://t.me/channel/123  (supports Range & repeated url=)");
   console.log("  /api/transcode ?url=https://t.me/channel/123 (HEVC → H.264)");
 });

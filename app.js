@@ -224,11 +224,25 @@ class RemoteZip {
     const nLen = dv.getUint16(eocdIdx + 20, true);
     this.comment = nLen ? new TextDecoder().decode(tail.subarray(eocdIdx + 22, eocdIdx + 22 + nLen)) : null;
 
+    // Split ZIP: offsets inside the EOCD are relative to the final volume
+    // (.zip). Our stream concatenates every volume, so add the prefix size.
+    const cdBase = conn && conn.parts && conn.parts.length
+      ? conn.parts[conn.parts.length - 1].start
+      : 0;
+    const eocdDisk = dv.getUint16(eocdIdx + 4, true);
+    const cdDisk = dv.getUint16(eocdIdx + 6, true);
+    if ((eocdDisk > 0 || cdDisk > 0) && (!conn || !conn.parts || conn.parts.length < 2)) {
+      throw new Error(
+        "This is a split ZIP archive (e.g. .z01 + .zip), but not all parts were found. " +
+        "Re-open the .zip post so ZipStream can locate every volume."
+      );
+    }
+
     // 2) ZIP64 support
     if (cdCount === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff) {
       const locIdx = eocdIdx - 20;
       if (locIdx >= 0 && dv.getUint32(locIdx, true) === ZIP64_LOC_SIG) {
-        const z64Off = bigIntFromPair(dv, locIdx + 8);
+        const z64Off = bigIntFromPair(dv, locIdx + 8) + cdBase;
         const rec = await getBytes(z64Off, 56, signal);
         const rd = new DataView(rec.buffer, rec.byteOffset, rec.byteLength);
         if (rd.getUint32(0, true) === ZIP64_EOCD_SIG) {
@@ -242,8 +256,8 @@ class RemoteZip {
     progressCb && progressCb(0.08);
 
     // 3) fetch + parse the central directory
-    const cd = await getAllBytes(cdOff, cdSize, (frac) => progressCb && progressCb(0.08 + frac * 0.9), signal);
-    parseCentralDirectory.call(this, cd, cdCount, cdOff);
+    const cd = await getAllBytes(cdOff + cdBase, cdSize, (frac) => progressCb && progressCb(0.08 + frac * 0.9), signal);
+    parseCentralDirectory.call(this, cd, cdCount, cdOff + cdBase, conn && conn.parts);
     progressCb && progressCb(1);
     return this.entries;
   }
@@ -255,8 +269,8 @@ function bigIntFromPair(dv, off) {
   return hi * 4294967296 + lo;
 }
 
-/** Parse central directory records from a Uint8Array (relative offsets = absolute − cdOffBase). */
-function parseCentralDirectory(cd, count, cdAbsOffset) {
+/** Parse central directory records; `parts` maps split-ZIP disk numbers to virtual stream offsets. */
+function parseCentralDirectory(cd, count, cdAbsOffset, parts) {
   const dv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
   const td = new TextDecoder();
   let p = 0;
@@ -271,12 +285,13 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
     const nameLen = dv.getUint16(p + 28, true);
     const extraLen = dv.getUint16(p + 30, true);
     const commentLen = dv.getUint16(p + 32, true);
+    const diskStartR = dv.getUint16(p + 34, true);
     const lhoR = dv.getUint32(p + 42, true);
 
     const name = decodeName(td, cd.subarray(p + 46, p + 46 + nameLen), flags);
-    let compSize = compSizeR, uncompSize = uncompSizeR, lo = lhoR;
+    let compSize = compSizeR, uncompSize = uncompSizeR, lo = lhoR, diskStart = diskStartR;
     // zip64 extra field
-    if (compSizeR === 0xffffffff || uncompSizeR === 0xffffffff || lhoR === 0xffffffff) {
+    if (compSizeR === 0xffffffff || uncompSizeR === 0xffffffff || lhoR === 0xffffffff || diskStartR === 0xffff) {
       let e = p + 46 + nameLen;
       const eEnd = e + extraLen;
       while (e + 4 <= eEnd) {
@@ -287,6 +302,7 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
           if (uncompSizeR === 0xffffffff) { uncompSize = bigIntFromPair(dv, q); q += 8; }
           if (compSizeR === 0xffffffff) { compSize = bigIntFromPair(dv, q); q += 8; }
           if (lhoR === 0xffffffff) { lo = bigIntFromPair(dv, q); q += 8; }
+          if (diskStartR === 0xffff) { diskStart = dv.getUint32(q, true); q += 4; }
           break;
         }
         e += 4 + sz;
@@ -296,8 +312,16 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
       ? decodeName(td, cd.subarray(p + 46 + nameLen + extraLen, p + 46 + nameLen + extraLen + commentLen), flags)
       : "";
 
+    // Split ZIP entries store offsets relative to their own volume (disk).
+    // The backend presents all volumes as one concatenated stream, so add
+    // the start offset of that volume to get an absolute virtual offset.
+    const diskPart = parts && parts[diskStart];
+    const partStart = diskPart ? diskPart.start : 0;
+    const partMissing = !!(parts && parts.length && !diskPart);
+
     this.entries.push({
-      name, method, flags, compSize, uncompSize, localOffset: lo, comment, crc, dosTime,
+      name, method, flags, compSize, uncompSize, localOffset: lo + partStart,
+      diskStart, partMissing, comment, crc, dosTime,
       isVideo: isPlayable(name),
     });
     p += 46 + nameLen + extraLen + commentLen;
@@ -449,9 +473,20 @@ function virtualUrl(entry, dataOff) {
 
 /** Resolve a local header to the exact byte offset where entry data begins. */
 async function resolveDataOff(entry, signal) {
+  if (entry.partMissing) {
+    throw new Error(
+      "This ZIP is split into several parts, and the volume containing this file is missing. " +
+      "Re-open the .zip post so ZipStream can find all parts (e.g. .z01 + .zip)."
+    );
+  }
   const sigLoc = await getBytes(entry.localOffset, 30, signal);
   const ldv = new DataView(sigLoc.buffer, sigLoc.byteOffset, sigLoc.byteLength);
-  if (ldv.getUint32(0, true) !== LOC_SIG) throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")");
+  if (ldv.getUint32(0, true) !== LOC_SIG) {
+    const hint = conn && conn.parts && conn.parts.length > 1
+      ? " — this is a split ZIP; make sure every part was found and loaded in order."
+      : "";
+    throw new Error("Corrupt ZIP (bad local header for " + entry.name + ")" + hint);
+  }
   const lNameLen = ldv.getUint16(26, true);
   const lExtraLen = ldv.getUint16(28, true);
   return entry.localOffset + 30 + lNameLen + lExtraLen;
@@ -541,12 +576,16 @@ function startStream(entry, dataOff) {
 /** Play via server-side transcode (HEVC → H.264 MP4) — works for ZIP entries too. */
 async function playViaTranscode(entry, dataOff, allowDownloadFallback = false) {
   if (!entry.isVideo && !isPlayable(entry.name)) return;
-  // Extract the original t.me URL from conn.url
-  let target = conn.url;
-  try { target = new URL(conn.url).searchParams.get("url") || conn.url; } catch { /* keep */ }
+  // All Telegram volumes (split ZIP) must be passed in order.
+  let targets = conn.tgUrls && conn.tgUrls.length ? conn.tgUrls : null;
+  if (!targets) {
+    try { targets = new URL(conn.url).searchParams.getAll("url"); } catch { /* keep */ }
+    if (!targets || !targets.length) targets = [conn.url];
+  }
+  const volumeParams = targets.map((t) => "url=" + encodeURIComponent(t)).join("&");
   // `play` is a cache-buster for the browser's media cache; the backend ignores it
   // (so the converted file is still reused).
-  const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(target)}` +
+  const transcodeUrl = `${BACKEND}/api/transcode?${volumeParams}` +
     `&off=${dataOff}&len=${entry.compSize}&pw=${encodeURIComponent(zipPassword)}&play=${Date.now()}`;
 
   revokeLast();
@@ -782,6 +821,11 @@ function escapeHtml(s) {
 
 const BACKEND = "http://localhost:8787";
 
+/** Backend stream URL for one file or several split-ZIP volumes (in order). */
+function backendStreamUrl(parts) {
+  return BACKEND + "/api/stream?" + parts.map((p) => "url=" + encodeURIComponent(p.url)).join("&");
+}
+
 /** Try the local MTProto backend first (it can stream real video attachments). */
 async function tryBackendResolve(tgUrl) {
   try {
@@ -855,15 +899,29 @@ async function handleTelegram(text) {
     return;
   }
   if (backend.status === "ok" && backend.data.kind === "file") {
-    const isZip = /\.zip$/i.test(backend.data.title) || /zip/i.test(backend.data.mime || "");
+    const isZip = /\.(zip|z\d{2})$/i.test(backend.data.title) || /zip/i.test(backend.data.mime || "");
     if (isZip) {
+      tgBody.innerHTML = "<p class='note'>Checking archive volumes…</p>";
+      let info = null;
+      try {
+        const r = await fetch(BACKEND + "/api/parts?url=" + encodeURIComponent(target));
+        info = await r.json();
+      } catch (e) { /* use the single post below */ }
+      const parts = info && info.ok && info.parts && info.parts.length
+        ? info.parts
+        : [{ url: target, title: backend.data.title, size: backend.data.size }];
+      const totalSize = info && info.ok ? info.totalSize : backend.data.size;
+      const split = parts.length > 1;
+      const missing = (info && info.missing) || [];
       tgBody.innerHTML =
-        `<p class="note">📦 This post is a <b>ZIP archive</b>:</p>` +
-        `<p class="note">${escapeHtml(backend.data.title)}<br><span class="meta">${fmtBytes(backend.data.size)}</span></p>` +
+        `<p class="note">📦 This post is ${split ? "part of a <b>split ZIP archive</b>" : "a <b>ZIP archive</b>"}:</p>` +
+        `<p class="note">${escapeHtml(backend.data.title)}<br><span class="meta">${fmtBytes(backend.data.size)}${split ? ` · ${parts.length} parts · ${fmtBytes(totalSize)} total` : ""}</span></p>` +
+        (split ? `<p class="note meta">Volumes: ${parts.map((p) => escapeHtml(p.title)).join(" + ")}</p>` : "") +
+        (missing.length ? `<p class="status warn">Missing volume(s): ${escapeHtml(missing.join(", "))}. Some videos may not be readable.</p>` : "") +
         `<div class="row"><button class="ghost" id="openZipBtn">📂 Open archive — list videos inside</button></div>` +
         `<p class="note tip">ZipStream reads the archive index over Range requests and streams one video at a time — no full download.</p>`;
       $("openZipBtn").addEventListener("click", () => {
-        urlInput.value = BACKEND + "/api/stream?url=" + encodeURIComponent(target);
+        urlInput.value = backendStreamUrl(parts);
         load();
       });
     } else {
@@ -987,21 +1045,51 @@ async function load() {
     // Format: http://localhost:8787/api/stream?url=https://t.me/...
     let knownSize = null;
     let probeUrl = url;
-    const backendStreamMatch = url.match(/^https?:\/\/[^\/]+\/api\/stream\?url=(.+)$/);
+    let connParts = null;
+    let connTitle = null;
+    let connTgUrls = null;
+    const backendStreamMatch = url.match(/^https?:\/\/[^/]+\/api\/stream\?(.+)$/);
     if (backendStreamMatch) {
-      // This is a backend stream URL - get the original Telegram URL
-      const originalUrl = decodeURIComponent(backendStreamMatch[1]);
-      // Resolve to get metadata (including size) from backend
-      try {
-        const res = await fetch(`http://localhost:8787/api/resolve?url=${encodeURIComponent(originalUrl)}`);
-        const meta = await res.json();
-        if (meta.ok && meta.size) {
-          knownSize = meta.size;
-          setStatus(`Using known ZIP size: ${fmtBytes(knownSize)}. Reading ZIP index…`);
+      // The URL may contain one ?url= (single file) or several (split ZIP volumes).
+      const q = new URLSearchParams(backendStreamMatch[1]);
+      const tgUrls = q.getAll("url");
+      const originalUrl = tgUrls[0];
+      if (originalUrl && parseTelegramLink(originalUrl)) {
+        // Ask the backend for all sibling volumes (.z01, .z02, …, .zip).
+        try {
+          const res = await fetch(BACKEND + "/api/parts?url=" + encodeURIComponent(originalUrl));
+          const info = await res.json();
+          if (info.ok && info.parts && info.parts.length) {
+            let start = 0;
+            connParts = info.parts.map((p) => {
+              const part = { ...p, start };
+              start += p.size;
+              return part;
+            });
+            connTgUrls = info.parts.map((p) => p.url);
+            connTitle = info.base || info.parts[0].title;
+            knownSize = info.totalSize;
+            probeUrl = backendStreamUrl(info.parts);
+            if (info.missing && info.missing.length) {
+              setStatus(`⚠️ This split ZIP is missing ${info.missing.join(", ")} — some videos may not be readable.`, "warn");
+            } else if (info.split) {
+              setStatus(`Split ZIP: ${info.parts.length} parts, total ${fmtBytes(knownSize)}. Reading ZIP index…`);
+            } else {
+              setStatus(`Using known ZIP size: ${fmtBytes(knownSize)}. Reading ZIP index…`);
+            }
+          }
+        } catch (e) { /* fall back to single-file resolve below */ }
+        if (!knownSize) {
+          try {
+            const res = await fetch(BACKEND + "/api/resolve?url=" + encodeURIComponent(originalUrl));
+            const meta = await res.json();
+            if (meta.ok && meta.size) {
+              knownSize = meta.size;
+              setStatus(`Using known ZIP size: ${fmtBytes(knownSize)}. Reading ZIP index…`);
+            }
+          } catch (e) { /* fall back to probe */ }
         }
-      } catch (e) { /* fall back to probe */ }
-      // Probe the backend stream URL (it supports Range), not the original Telegram URL
-      probeUrl = url;
+      }
     }
 
     setStatus("Connecting…");
@@ -1017,7 +1105,7 @@ async function load() {
       );
       return;
     }
-    conn = { key: p.key, total: knownSize || null, url: probeUrl };
+    conn = { key: p.key, total: knownSize || null, url: probeUrl, parts: connParts, tgUrls: connTgUrls, title: connTitle };
     const msg = knownSize
       ? `Connected via ${p.key === null ? "direct" : p.key}. Known ZIP size ${fmtBytes(knownSize)}. Reading ZIP index…`
       : `Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`;
@@ -1027,8 +1115,8 @@ async function load() {
     const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`), signal.signal, knownSize);
 
     filesCard.hidden = false;
-    zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
-    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}`;
+    zipNameEl.textContent = conn.title || url.split("/").pop().split("?")[0] || url;
+    zipMetaEl.textContent = `${entries.length} files${conn.total ? ` · ZIP size ${fmtBytes(conn.total)}` : ""}${conn.parts && conn.parts.length > 1 ? ` · ${conn.parts.length} parts` : ""}`;
     // sort: playable first
     const sorted = [...entries].sort((a, b) => Number(isPlayable(b.name)) - Number(isPlayable(a.name)));
     renderEntries(sorted);
