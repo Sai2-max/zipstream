@@ -470,7 +470,10 @@ async function playEntry(entry) {
   currentAbort = signal;
 
   try {
-    const dataOff = await resolveDataOff(entry, signal.signal);
+    // Cache the resolved offset: replays skip the extra round-trip.
+    setStatus(`⏳ Locating "${entry.name}" inside the archive…`, "warn");
+    const dataOff = entry.dataOff != null ? entry.dataOff : await resolveDataOff(entry, signal.signal);
+    entry.dataOff = dataOff;
 
     // Encrypted entries can't be range-streamed: ZipCrypto is sequential.
     // Videos are decrypted + converted on the backend (the source is usually
