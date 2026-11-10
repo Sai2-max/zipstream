@@ -4,6 +4,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import bigInt from "big-integer";
 import ffmpeg from "fluent-ffmpeg";
@@ -12,6 +13,14 @@ import { loadEnv, createClient, resolveMedia } from "./common.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 8787);
+// Converted videos are cached here: first play converts, replays are instant/seekable.
+const TRANSCODE_CACHE_DIR = path.join(__dirname, ".cache", "transcode");
+fs.mkdirSync(TRANSCODE_CACHE_DIR, { recursive: true });
+const transcodeJobs = new Map(); // cache key -> Promise<cached file path>
+// A crash/restart can leave half-written conversions behind; they are unusable.
+for (const f of fs.readdirSync(TRANSCODE_CACHE_DIR)) {
+  if (f.endsWith(".part")) fs.rm(path.join(TRANSCODE_CACHE_DIR, f), { force: true }, () => {});
+}
 const CHUNK = 1024 * 1024;        // 1 MB per HTTP response chunk
 const REQUEST_SIZE = 512 * 1024;  // MTProto GetFile request size (Telegram's max)
 const CACHE_TTL = 10 * 60 * 1000; // keep resolved message (file ref) for 10 min
@@ -347,7 +356,43 @@ async function pumpMedia(req, res, meta, start, length, headers, status) {
   }
 }
 
-/** Transcode endpoint: streams Telegram video (or ZIP entry) through FFmpeg (HEVC → H.264) for browser playback. */
+/** Stable cache key for one converted video. */
+function transcodeKey(target, dataOff, size, password) {
+  return crypto.createHash("sha1")
+    .update(`${target}|${dataOff}|${size}|${password}`)
+    .digest("hex");
+}
+
+/** Serve a cached MP4 with HTTP Range support (instant replay + seeking). */
+function serveCachedVideo(req, res, file) {
+  let st;
+  try { st = fs.statSync(file); } catch { return sendJson(res, 404, { ok: false, error: "not ready" }); }
+  const size = st.size;
+  if (!size) return sendJson(res, 503, { ok: false, error: "conversion still running" });
+  const range = parseRange(req.headers.range, size);
+  if (range && range.unsatisfiable) {
+    res.writeHead(416, { "Content-Range": `bytes */${size}`, ...CORS });
+    return res.end();
+  }
+  const start = range ? range.start : 0;
+  const end = range ? range.end : size - 1;
+  const headers = {
+    "Content-Type": "video/mp4",
+    "Content-Length": end - start + 1,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    ...CORS,
+  };
+  if (range) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+  res.writeHead(range ? 206 : 200, headers);
+  if (req.method === "HEAD") return res.end();
+  fs.createReadStream(file, { start, end })
+    .on("error", () => { if (!res.writableEnded) res.destroy(); })
+    .pipe(res);
+}
+
+/** Transcode endpoint: streams Telegram video (or ZIP entry) through FFmpeg (HEVC → H.264) for browser playback.
+ *  The converted MP4 is cached on disk, so the first play converts and every replay is instant + seekable. */
 async function handleTranscode(req, res, url) {
   const target = url.searchParams.get("url");
   const dataOff = Number(url.searchParams.get("off"));
@@ -371,10 +416,58 @@ async function handleTranscode(req, res, url) {
     return sendJson(res, 400, { ok: false, error: "Not a video file. Use /api/stream for ZIP entries." });
   }
 
-  const range = req.headers.range;
+  const key = transcodeKey(target, isZipEntry ? dataOff : -1, isZipEntry ? compSize : meta.size, password);
+  const cachePath = path.join(TRANSCODE_CACHE_DIR, key + ".mp4");
 
-  // We don't know the output size in advance (transcoding changes it)
-  // So we stream without Content-Length, using chunked transfer
+  // Already converted before → instant, seekable playback.
+  if (fs.existsSync(cachePath)) return serveCachedVideo(req, res, cachePath);
+
+  // Same video is already being converted → wait for it, then serve the file.
+  if (transcodeJobs.has(key)) {
+    try {
+      const file = await transcodeJobs.get(key);
+      return serveCachedVideo(req, res, file);
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: e.message });
+    }
+  }
+
+  if (req.method === "HEAD") {
+    res.writeHead(200, {
+      "Content-Type": "video/mp4",
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store",
+      ...CORS,
+    });
+    return res.end();
+  }
+
+  const tmpPath = cachePath + ".part";
+  let jobResolve, jobReject;
+  const job = new Promise((resolve, reject) => { jobResolve = resolve; jobReject = reject; });
+  transcodeJobs.set(key, job);
+
+  const { PassThrough } = await import("node:stream");
+  const outputStream = new PassThrough({ highWaterMark: 1024 * 1024 });
+  const fileOut = fs.createWriteStream(tmpPath);
+  let finished = false;
+
+  const fail = (err) => {
+    if (finished) return;
+    finished = true;
+    transcodeJobs.delete(key);
+    fs.rm(tmpPath, { force: true }, () => {});
+    jobReject(err instanceof Error ? err : new Error(String(err)));
+    if (!res.writableEnded && !res.destroyed) res.destroy(err instanceof Error ? err : undefined);
+    outputStream.destroy();
+  };
+
+  // Client went away → keep converting so the cache is ready for the next play.
+  res.on("close", () => {
+    if (!res.writableEnded) { try { outputStream.unpipe(res); } catch { /* ignore */ } }
+  });
+
+  // Output size is unknown while converting → chunked transfer for the first play.
   res.writeHead(200, {
     "Content-Type": "video/mp4",
     "Accept-Ranges": "bytes",
@@ -382,22 +475,19 @@ async function handleTranscode(req, res, url) {
     "Transfer-Encoding": "chunked",
     ...CORS,
   });
-
-  if (req.method === "HEAD") return res.end();
-
-  // Create a PassThrough stream for FFmpeg output
-  const { PassThrough } = await import("node:stream");
-  const outputStream = new PassThrough();
-
-  // Pipe FFmpeg output to HTTP response
   outputStream.pipe(res);
+  outputStream.pipe(fileOut);
 
-  let ffmpegProcess = null;
-
-  // Handle client disconnect
-  req.on("close", () => {
-    if (ffmpegProcess?.ffmpegProc) ffmpegProcess.ffmpegProc.kill("SIGKILL");
-    outputStream.destroy();
+  fileOut.on("error", fail);
+  fileOut.on("finish", () => {
+    if (finished) return;
+    finished = true;
+    fs.rename(tmpPath, cachePath, (err) => {
+      transcodeJobs.delete(key);
+      if (err) return jobReject(err);
+      console.log("[transcode] cached:", path.basename(cachePath));
+      jobResolve(cachePath);
+    });
   });
 
   try {
@@ -410,8 +500,7 @@ async function handleTranscode(req, res, url) {
 
     const tmpDir = await mkdtemp(join(tmpdir(), "zipstream-transcode-"));
     const inputPath = join(tmpDir, "input.mp4");
-    const { createWriteStream } = await import("node:fs");
-    const writeStream = createWriteStream(inputPath);
+    const writeStream = fs.createWriteStream(inputPath);
 
     // Download the entry (decrypted) to temp file
     let inputStream;
@@ -448,9 +537,9 @@ async function handleTranscode(req, res, url) {
     console.log("[transcode] buffered to temp file, starting FFmpeg");
 
     // Start FFmpeg reading from temp file
-    ffmpegProcess = ffmpeg(inputPath)
+    ffmpeg(inputPath)
       .inputOptions([
-        "-analyzeduration", "10000000",  // 10ms analyze
+        "-analyzeduration", "10000000",
         "-probesize", "5000000",
       ])
       .outputOptions([
@@ -469,19 +558,18 @@ async function handleTranscode(req, res, url) {
       .on("start", (cmd) => console.log("[transcode] FFmpeg started:", cmd))
       .on("error", (err) => {
         console.error("[transcode] FFmpeg error:", err.message);
-        if (!res.writableEnded) res.destroy(err);
+        fail(err);
       })
       .on("end", () => {
         console.log("[transcode] FFmpeg finished");
-        if (!res.writableEnded) outputStream.end();
-        // Cleanup temp file after done
         rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+        // outputStream ends here (pipe end:true) → fileOut finishes → rename to cache
       })
       .pipe(outputStream, { end: true });
 
   } catch (e) {
     console.error("[transcode] setup error:", e.message);
-    if (!res.writableEnded) res.destroy(e);
+    fail(e);
   }
 }
 

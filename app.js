@@ -296,7 +296,10 @@ function parseCentralDirectory(cd, count, cdAbsOffset) {
       ? decodeName(td, cd.subarray(p + 46 + nameLen + extraLen, p + 46 + nameLen + extraLen + commentLen), flags)
       : "";
 
-    this.entries.push({ name, method, flags, compSize, uncompSize, localOffset: lo, comment, crc, dosTime });
+    this.entries.push({
+      name, method, flags, compSize, uncompSize, localOffset: lo, comment, crc, dosTime,
+      isVideo: isPlayable(name),
+    });
     p += 46 + nameLen + extraLen + commentLen;
   }
   if (!this.entries.length) throw new Error("ZIP index parsed but it has 0 entries (encrypted or non-standard ZIP?).");
@@ -469,15 +472,20 @@ async function playEntry(entry) {
   try {
     const dataOff = await resolveDataOff(entry, signal.signal);
 
-    // Encrypted entries can't be range-streamed: ZipCrypto is sequential, so
-    // download + decrypt the entry instead of handing a virtual URL to <video>.
+    // Encrypted entries can't be range-streamed: ZipCrypto is sequential.
+    // Videos are decrypted + converted on the backend (the source is usually
+    // HEVC, which browsers cannot decode anyway). Other files are downloaded.
     if (isEncrypted(entry)) {
       if (!zipPassword) {
         pwRow.hidden = false;
         zipPasswordEl.focus();
         throw new Error("🔒 This archive is password-protected. Type the ZIP password above, click Unlock, then press Play again.");
       }
-      await playEntryBlob(entry, dataOff, signal);
+      if (entry.isVideo) {
+        await playViaTranscode(entry, dataOff);
+        return;
+      }
+      await playEntryBlob(entry, dataOff, signal, false);
       return;
     }
 
@@ -513,10 +521,7 @@ function startStream(entry, dataOff) {
     player.src = "";
     // Always try transcode for codec errors (works for both direct and ZIP)
     setStatus("Streaming failed — trying server-side transcode (HEVC→H.264)…", "warn");
-    playViaTranscode(entry, dataOff).catch(() => {
-      setStatus("Transcode failed — downloading entry for local playback…", "warn");
-      playEntryBlob(entry, dataOff, new AbortController()).catch(() => {});
-    });
+    playViaTranscode(entry, dataOff, true);
   };
   
   player.onerror = handleError;
@@ -531,24 +536,69 @@ function startStream(entry, dataOff) {
 }
 
 /** Play via server-side transcode (HEVC → H.264 MP4) — works for ZIP entries too. */
-async function playViaTranscode(entry, dataOff) {
-  if (!entry.isVideo) return;
+async function playViaTranscode(entry, dataOff, allowDownloadFallback = false) {
+  if (!entry.isVideo && !isPlayable(entry.name)) return;
   // Extract the original t.me URL from conn.url
   let target = conn.url;
   try { target = new URL(conn.url).searchParams.get("url") || conn.url; } catch { /* keep */ }
+  // `play` is a cache-buster for the browser's media cache; the backend ignores it
+  // (so the converted file is still reused).
   const transcodeUrl = `${BACKEND}/api/transcode?url=${encodeURIComponent(target)}` +
-    `&off=${dataOff}&len=${entry.compSize}&pw=${encodeURIComponent(zipPassword)}`;
-  fetchMeta.textContent = "Transcoding HEVC → H.264 (server-side)…";
+    `&off=${dataOff}&len=${entry.compSize}&pw=${encodeURIComponent(zipPassword)}&play=${Date.now()}`;
+
   revokeLast();
   player.src = "";
   player.onerror = null;
+  player.onloadeddata = null;
+  streamActive = false;
+  fetchMeta.textContent =
+    "The source is HEVC, which browsers can't decode. The server downloads + converts it to H.264. " +
+    "First play can take 1–2 minutes; afterwards it is cached and starts instantly.";
+
+  let elapsed = 0;
+  const timer = setInterval(() => {
+    elapsed += 1;
+    setStatus(
+      `⏳ Preparing "${entry.name}" — downloading from Telegram and converting to a browser format… ${elapsed}s` +
+      (elapsed > 20 ? " (first play only; the result is cached)" : ""),
+      "warn"
+    );
+  }, 1000);
+  const stopTimer = () => { clearInterval(timer); };
+
+  player.onloadeddata = () => {
+    stopTimer();
+    setStatus(`▶ Playing "${entry.name}" — converted to H.264 for browser playback.`, "ok");
+  };
+  player.onerror = () => {
+    stopTimer();
+    if (allowDownloadFallback) {
+      setStatus("Conversion failed — downloading this entry for local playback…", "warn");
+      playEntryBlob(entry, dataOff, new AbortController(), false).catch(() => {});
+      return;
+    }
+    setStatus(
+      "❌ Couldn't play this video after conversion. Try again, or use the download button and open it in VLC.",
+      "err"
+    );
+  };
+
   player.src = transcodeUrl;
-  await player.play().catch(() => {});
-  setStatus(`▶ Transcoding "${entry.name}" — server converts HEVC→H.264 for browser playback.`, "ok");
+  setStatus(`⏳ Preparing "${entry.name}" — downloading from Telegram and converting to a browser format…`, "warn");
+  try {
+    await player.play();
+    stopTimer();
+    setStatus(`▶ Playing "${entry.name}" — converted to H.264 for browser playback.`, "ok");
+  } catch (e) {
+    if (e.name === "NotSupportedError" || e.name === "MediaError") {
+      player.onerror && player.onerror();
+    }
+    // Autoplay blocked → the user can press the native play button; keep waiting text.
+  }
 }
 
 /** Fallback: download the whole entry, decrypt/inflate if needed, play from a Blob. */
-async function playEntryBlob(entry, dataOff, signal) {
+async function playEntryBlob(entry, dataOff, signal, allowTranscode = true) {
   const encrypted = isEncrypted(entry);
   fetchMeta.textContent = encrypted
     ? "Encrypted entry — downloading and decrypting in your browser"
@@ -591,8 +641,19 @@ async function playEntryBlob(entry, dataOff, signal) {
   const came = chunks.reduce((s, c) => s + c.byteLength, 0);
   const blob = new Blob(chunks, { type: extType(entry.name) || "application/octet-stream" });
   lastObjectURL = URL.createObjectURL(blob);
+  // If the browser cannot decode this codec (e.g. HEVC), convert on the server.
+  player.onerror = null;
+  if (allowTranscode && isPlayable(entry.name)) {
+    player.onerror = () => {
+      player.onerror = null;
+      setStatus("This file's codec isn't supported by the browser — converting on the server (HEVC→H.264)…", "warn");
+      playViaTranscode(entry, dataOff, false);
+    };
+  }
   player.src = lastObjectURL;
-  player.play().catch(() => {});
+  player.play().catch((e) => {
+    if ((e.name === "NotSupportedError" || e.name === "MediaError") && player.onerror) player.onerror();
+  });
   const secs = (performance.now() - t0) / 1000;
   setProgress(false);
   setStatus(
@@ -754,8 +815,24 @@ function playStreamUrl(url, meta) {
   revokeLast();
   player.src = "";
   player.onerror = null;
+  // HEVC direct videos: fall back to the server transcoder once.
+  let converted = false;
+  player.onerror = () => {
+    if (converted) return;
+    converted = true;
+    try {
+      const target = new URL(url, location.href).searchParams.get("url");
+      if (!target) return;
+      player.onerror = null;
+      setStatus("Direct stream couldn't play (unsupported codec) — converting HEVC→H.264 on the server…", "warn");
+      player.src = BACKEND + "/api/transcode?url=" + encodeURIComponent(target) + "&play=" + Date.now();
+      player.play().catch(() => {});
+    } catch { /* ignore */ }
+  };
   player.src = url;
-  player.play().catch(() => {});
+  player.play().catch((e) => {
+    if ((e.name === "NotSupportedError" || e.name === "MediaError") && player.onerror) player.onerror();
+  });
   filesCard.hidden = true;
   tgCard.hidden = true;
   setStatus(`▶ Streaming "${meta.title || "Telegram video"}" — the backend serves only the byte ranges requested.`, "ok");
