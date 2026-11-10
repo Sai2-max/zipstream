@@ -440,7 +440,8 @@ async function readCompressedEntry(entry, dataOff, signal, onProgress) {
       headerGot += take;
       c = c.subarray(take);
       if (headerGot < 12) continue;
-      cipher.decrypt(header); // advance the key state past the header
+      const decHeader = cipher.decrypt(header); // advance the key state past the header
+      header.set(decHeader);
       checked = true;
       // Check byte: high byte of DOS time when a data descriptor follows,
       // otherwise the high byte of the CRC-32.
