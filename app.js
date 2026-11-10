@@ -200,10 +200,9 @@ class RemoteZip {
     this.comment = null;
   }
 
-  async open(progressCb, signal) {
-    // 1) find the exact file size with 1-byte probes (Content-Range is hidden
-    //    by CORS on strict hosts, so we never rely on it)
-    const total = await findSize(signal);
+  async open(progressCb, signal, knownSize) {
+    // 1) Use known size if provided, otherwise find with 1-byte probes
+    const total = knownSize !== undefined ? knownSize : await findSize(signal);
     conn.total = total;
     progressCb && progressCb(0.02);
 
@@ -903,10 +902,32 @@ async function load() {
       await handleTelegram(url);
       return;
     }
+
+    // Check if this is a backend stream URL (from Telegram handler)
+    // Format: http://localhost:8787/api/stream?url=https://t.me/...
+    let knownSize = null;
+    let probeUrl = url;
+    const backendStreamMatch = url.match(/^https?:\/\/[^\/]+\/api\/stream\?url=(.+)$/);
+    if (backendStreamMatch) {
+      // This is a backend stream URL - get the original Telegram URL
+      const originalUrl = decodeURIComponent(backendStreamMatch[1]);
+      // Resolve to get metadata (including size) from backend
+      try {
+        const res = await fetch(`http://localhost:8787/api/resolve?url=${encodeURIComponent(originalUrl)}`);
+        const meta = await res.json();
+        if (meta.ok && meta.size) {
+          knownSize = meta.size;
+          setStatus(`Using known ZIP size: ${fmtBytes(knownSize)}. Reading ZIP index…`);
+        }
+      } catch (e) { /* fall back to probe */ }
+      // Probe the backend stream URL (it supports Range), not the original Telegram URL
+      probeUrl = url;
+    }
+
     setStatus("Connecting…");
     const signal = new AbortController();
     currentAbort = signal;
-    const p = await probe(url, signal.signal);
+    const p = await probe(probeUrl, signal.signal);
     if (!p) {
       setStatus(
         "❌ Couldn't find any connection that supports HTTP Range requests for this URL.\n" +
@@ -916,11 +937,14 @@ async function load() {
       );
       return;
     }
-    conn = { key: p.key, total: null, url };
-    setStatus(`Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`);
+    conn = { key: p.key, total: knownSize || null, url: probeUrl };
+    const msg = knownSize
+      ? `Connected via ${p.key === null ? "direct" : p.key}. Known ZIP size ${fmtBytes(knownSize)}. Reading ZIP index…`
+      : `Connected via ${p.key === null ? "direct" : p.key}. Measuring file size + reading ZIP index…`;
+    setStatus(msg);
 
     const zip = new RemoteZip();
-    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`));
+    const entries = await zip.open((f) => setProgress(true, f * 100, `reading ZIP index… ${Math.round(f * 100)}%`), signal.signal, knownSize);
 
     filesCard.hidden = false;
     zipNameEl.textContent = url.split("/").pop().split("?")[0] || url;
